@@ -1,0 +1,12 @@
+﻿test_find_model_local_path_project_dir: PASSED
+test_find_model_local_path_not_found: PASSED
+test_find_model_local_path_modelscope_cache: PASSED
+test_config_local_paths_not_hardcoded: PASSED
+test_config_local_paths_are_none_or_valid_dir: PASSED
+test_embedding_modelscope_available_flag: PASSED
+test_mgeo_model_modelscope_available_flag: PASSED
+test_embedding_has_try_load_methods: PASSED
+test_mgeo_model_has_try_load_methods: PASSED
+test_find_model_local_path_with_env_var: PASSED
+
+===== ALL TESTS PASSED =====

@@ -1,0 +1,45 @@
+%% 中文地址语义匹配系统 - Mermaid架构图
+%% 可在 https://mermaid.live/ 中查看
+
+%% 1. 系统整体架构
+graph TB
+    subgraph 前端展示层
+        UI[Streamlit Web界面]
+        UI --> DB_CONFIG[⚙️ 数据库配置]
+        UI --> VEC_PREP[📊 向量预处理]
+        UI --> ADDR_MATCH[🔍 地址匹配]
+        UI --> RESULT_MGR[📋 结果管理]
+        UI --> SYS_LOG[📝 系统日志]
+    end
+
+    subgraph 业务逻辑层
+        MATCHER[匹配引擎 AddressMatcher]
+        RANKING[精排引擎 RankingEngine]
+        MATCHER --> RANKING
+    end
+
+    subgraph 模型层
+        EMBEDDER[向量化模型 MGeo Backbone 768维]
+        MGEO[MGeo精排模型 三分类 exact/partial/not]
+        RANKING --> MGEO
+    end
+
+    subgraph 数据层
+        DB_CONN[数据库连接 DBConnection]
+        DATA_LOADER[数据加载器 DataLoader]
+        VECTOR_STORE[向量存储 VectorStore]
+        DB_CONN --> DATA_LOADER
+        DB_CONN --> VECTOR_STORE
+    end
+
+    subgraph 存储层
+        PG[(PostgreSQL + pgvector)]
+    end
+
+    UI --> MATCHER
+    UI --> DATA_LOADER
+    UI --> VECTOR_STORE
+    UI --> EMBEDDER
+    DATA_LOADER --> PG
+    VECTOR_STORE --> PG
+    DB_CONN --> PG

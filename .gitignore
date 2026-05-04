@@ -1,0 +1,64 @@
+# --- Secrets / environment ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+venv/
+env/
+ENV/
+.venv/
+
+# --- Large model / weight files ---
+models/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+*.ckpt
+
+# --- Distribution / wheels ---
+*.whl
+dist/
+build/
+*.egg
+
+# --- Logs ---
+*.log
+logs/
+app.log
+
+# --- IDE / tooling ---
+.idea/
+.vscode/
+.trae/
+.agents/
+.claude/
+*.iml
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Project-specific backups / temp ---
+*副本*
+*backup*
+*.bak
+*.tmp
+~$*
+
+# --- Skills lock (auto-managed) ---
+skills-lock.json

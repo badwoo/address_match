@@ -1,0 +1,11 @@
+﻿test_batch_recall_accepts_threshold_param: PASSED
+test_batch_recall_sql_has_threshold_condition: PASSED
+test_batch_rank_optimized_accepts_threshold_param: PASSED
+test_rank_method_uses_threshold: PASSED
+test_batch_rank_optimized_filters_by_threshold: PASSED
+test_matcher_passes_threshold_to_batch_recall: PASSED
+test_matcher_passes_threshold_to_batch_rank_optimized: PASSED
+test_ranking_engine_threshold_default: PASSED
+test_ranking_filter_logic: PASSED
+
+===== ALL TESTS PASSED =====
