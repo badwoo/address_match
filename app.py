@@ -30,10 +30,10 @@ from database.connection import DBConnection
 from database.data_loader import DataLoader
 from database.vector_store import VectorStore
 from config import Config
-from utils.logger import logger, setup_logger
-
-# 初始化日志文件输出
-setup_logger()
+from utils.logger import logger, setup_db_logging
+from utils.pinyin_utils import tag_to_prefix, get_tag_tables
+from database.tag_manager import TagManager
+from ui_theme import Colors, Spacing, Typography, card_style, status_container_style, inject_global_styles
 
 def format_time(seconds):
     if seconds < 60:
@@ -253,6 +253,16 @@ def init_session_state():
             'copy_table': ''
         }
 
+    # 标签相关状态
+    if 'current_tag' not in st.session_state:
+        st.session_state.current_tag = ''
+    if 'current_tag_prefix' not in st.session_state:
+        st.session_state.current_tag_prefix = ''
+    if 'current_recall_table' not in st.session_state:
+        st.session_state.current_recall_table = Config.RECALL_RESULTS_TABLE
+    if 'current_match_table' not in st.session_state:
+        st.session_state.current_match_table = Config.MATCH_RESULTS_TABLE
+
     # 人工纠正相关状态
     if 'manual_correction_mode' not in st.session_state:
         st.session_state.manual_correction_mode = False
@@ -308,7 +318,8 @@ def show_db_config():
                 st.success("数据库连接成功！")
                 st.session_state.connected = True
                 st.session_state.db_conn = db_conn
-                logger.info("Database connection successful")
+                setup_db_logging(db_conn)
+                logger.warning("Database connection established")
             else:
                 st.error("数据库连接失败，请检查配置")
     
@@ -327,6 +338,14 @@ def show_db_config():
         except Exception as e:
             st.error(f"获取表信息失败: {str(e)}")
 
+@st.cache_resource(ttl=60, show_spinner=False)
+def _get_cached_db_connection(host, port, dbname, user, password, schema):
+    """缓存的 DB 连接，避免每次 st.rerun() 都重建 TCP 连接。TTL=60s。"""
+    conn = DBConnection(host=host, port=port, schema=schema, dbname=dbname, user=user, password=password)
+    if conn.connect():
+        return conn
+    return None
+
 def show_vector_preprocess():
     """向量预处理页面：配置企业表和标准地址表的字段映射，执行向量化"""
     if not st.session_state.connected:
@@ -334,7 +353,7 @@ def show_vector_preprocess():
         return
     
     db_config = st.session_state.db_config
-    db_conn = DBConnection(
+    db_conn = _get_cached_db_connection(
         host=db_config['host'],
         port=db_config['port'],
         schema=db_config['schema'],
@@ -342,20 +361,18 @@ def show_vector_preprocess():
         user=db_config['user'],
         password=db_config['password']
     )
-    
-    if not db_conn.connect():
+
+    if db_conn is None:
         st.error("无法连接数据库，请检查配置")
         return
-    
+
     try:
         tables = db_conn.get_tables()
         if not tables:
             st.warning("数据库中没有可用的数据表")
-            db_conn.close()
             return
     except Exception as e:
         st.error(f"获取数据表列表失败: {str(e)}")
-        db_conn.close()
         return
     
     # 企业表向量化配置
@@ -506,8 +523,29 @@ def show_vector_preprocess():
     st.write(f"企业向量表记录数: {enterprise_count}")
     st.write(f"标准地址向量表记录数: {standard_count}")
     
+    # 初始化向量化状态
+    if 'vec_status' not in st.session_state:
+        st.session_state.vec_status = {
+            'is_running': False,
+            'table_type': '',
+            'cancel_requested': False,
+            'processed_count': 0,
+            'total_count': 0,
+            'progress': 0.0,
+            'speed': 0.0,
+            'elapsed': 0.0,
+            'remaining': 0.0,
+            'status_message': '',
+            'error_message': '',
+            'completed': False,
+            'cancelled': False,
+            'start_datetime': '',
+            'end_datetime': '',
+            'execution_time': 0.0
+        }
+
     st.divider()
-    
+
     # 向量表管理操作
     with st.expander("向量表管理", expanded=True):
         col1, col2, col3, col4 = st.columns(4)
@@ -515,15 +553,13 @@ def show_vector_preprocess():
             if st.button("创建企业向量表"):
                 with st.spinner("正在创建企业向量表..."):
                     if vector_store.create_vector_table(Config.ENTERPRISE_VECTOR_TABLE, table_type='enterprise'):
-                        vector_store.create_vector_index(Config.ENTERPRISE_VECTOR_TABLE, 'idx_enterprise_vector')
-                        st.success("企业向量表及索引创建成功")
-        
+                        st.success("企业向量表创建成功")
+
         with col2:
             if st.button("创建标准地址向量表"):
                 with st.spinner("正在创建标准地址向量表..."):
                     if vector_store.create_vector_table(Config.STANDARD_VECTOR_TABLE, table_type='standard'):
-                        vector_store.create_vector_index(Config.STANDARD_VECTOR_TABLE, 'idx_standard_vector')
-                        st.success("标准地址向量表及索引创建成功")
+                        st.success("标准地址向量表创建成功")
         
         with col3:
             if st.button("清空企业向量表"):
@@ -549,66 +585,222 @@ def show_vector_preprocess():
                     st.session_state.confirm_delete = True
         else:
             st.info("没有找到向量表")
-    
+
     st.divider()
-    
-    # 向量化执行区域
+
+    # ========== 阶段1：向量化执行 ==========
     st.subheader("开始向量化")
     vec_device = _render_device_selector(key='vec_device_selector')
     batch_size = st.number_input("处理批次大小", value=1000, min_value=100, max_value=10000)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("企业表向量化"):
-            process_enterprise_vectorization(
-                st.session_state.vec_config['enterprise_table'], 
-                st.session_state.vec_config['enterprise_id_col'], 
-                st.session_state.vec_config['enterprise_name_col'], 
-                st.session_state.vec_config['enterprise_address_col'], 
-                batch_size,
-                vec_device
-            )
-    
-    with col2:
-        if st.button("标准地址表向量化"):
-            process_standard_vectorization(
-                st.session_state.vec_config['standard_table'], 
-                st.session_state.vec_config['standard_id_col'], 
-                st.session_state.vec_config['standard_address_col'], 
-                st.session_state.vec_config['standard_room_col'],
-                batch_size,
-                vec_device
-            )
-    
+
+    vec_status = st.session_state.vec_status
+
+    if vec_status['is_running']:
+        progress_bar = st.progress(min(vec_status['progress'], 1.0))
+        st.text(f"📦 已处理 {vec_status['processed_count']:,}/{vec_status['total_count']:,} ({vec_status['progress']*100:.1f}%)")
+        st.text(f"⚡ 处理速度: {vec_status['speed']:.2f} 条/秒")
+        st.text(f"⏱ 已执行时间: {format_time(vec_status['elapsed'])}")
+        if vec_status['remaining'] > 0:
+            st.text(f"⏳ 预计剩余时间: {format_time(vec_status['remaining'])}")
+        st.info(vec_status['status_message'])
+
+        if st.button("⏹ 取消向量化", type="primary"):
+            st.session_state.vec_status['cancel_requested'] = True
+            st.rerun()
+        time.sleep(5)
+        st.rerun()
+
+    elif vec_status['completed']:
+        st.success(f"✅ {vec_status['status_message']}")
+        st.text(f"开始时间: {vec_status['start_datetime']}")
+        st.text(f"结束时间: {vec_status['end_datetime']}")
+        st.text(f"总耗时: {format_time(vec_status['execution_time'])}")
+        st.text(f"平均速度: {vec_status['processed_count'] / vec_status['execution_time']:.2f} 条/秒" if vec_status['execution_time'] > 0 else "")
+        if st.button("清除状态", key='vec_clear_completed'):
+            st.session_state.vec_status = _init_vec_status()
+            st.rerun()
+
+    elif vec_status['cancelled']:
+        st.warning(f"⚠️ 向量化已取消 - {vec_status['status_message']}")
+        if st.button("清除状态", key='vec_clear_cancelled'):
+            st.session_state.vec_status = _init_vec_status()
+            st.rerun()
+
+    elif vec_status['error_message']:
+        st.error(f"❌ 向量化失败: {vec_status['error_message']}")
+        if st.button("清除状态", key='vec_clear_error'):
+            st.session_state.vec_status = _init_vec_status()
+            st.rerun()
+
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("企业表向量化", use_container_width=True):
+                if not st.session_state.vec_config['enterprise_table'] or \
+                   not st.session_state.vec_config['enterprise_id_col'] or \
+                   not st.session_state.vec_config['enterprise_name_col'] or \
+                   not st.session_state.vec_config['enterprise_address_col']:
+                    st.error("请先选择企业表和对应的字段")
+                else:
+                    _start_vectorization('enterprise', batch_size, vec_device)
+                    st.rerun()
+
+        with col2:
+            if st.button("标准地址表向量化", use_container_width=True):
+                if not st.session_state.vec_config['standard_table'] or \
+                   not st.session_state.vec_config['standard_id_col'] or \
+                   not st.session_state.vec_config['standard_address_col']:
+                    st.error("请先选择标准地址表和对应的字段")
+                else:
+                    _start_vectorization('standard', batch_size, vec_device)
+                    st.rerun()
+
+    st.divider()
+
+    # ========== 阶段2：创建向量索引 ==========
+    st.subheader("创建向量索引")
+
+    index_vec_tables = {}
+    if vector_store.get_vector_count(Config.ENTERPRISE_VECTOR_TABLE) > 0:
+        index_vec_tables[Config.ENTERPRISE_VECTOR_TABLE] = (Config.ENTERPRISE_VECTOR_TABLE, 'idx_enterprise_vector')
+    if vector_store.get_vector_count(Config.STANDARD_VECTOR_TABLE) > 0:
+        index_vec_tables[Config.STANDARD_VECTOR_TABLE] = (Config.STANDARD_VECTOR_TABLE, 'idx_standard_vector')
+
+    if not index_vec_tables:
+        st.info("暂无已向量化的数据表，请先执行阶段1（向量化）")
+    else:
+        selected_label = st.selectbox("选择向量表", list(index_vec_tables.keys()))
+        selected_table, selected_index = index_vec_tables[selected_label]
+        row_count = vector_store.get_vector_count(selected_table)
+        st.write(f"当前数据量: {row_count:,} 条")
+
+        index_type = st.selectbox("索引类型", ['ivfflat', 'hnsw'])
+
+        # 自动计算默认参数
+        if row_count <= 1_000_000:
+            auto_lists = max(100, min(4000, row_count // 1000))
+        else:
+            auto_lists = max(100, min(4000, int(row_count ** 0.5)))
+
+        maintenance_work_mem = st.text_input("maintenance_work_mem", value="1GB",
+                                             help="索引创建时的维护内存，如 1GB、512MB")
+
+        if index_type == 'ivfflat':
+            lists = st.number_input("lists 参数", value=auto_lists, min_value=10, max_value=10000,
+                                    help=f"自动计算值: {auto_lists}（基于 {row_count:,} 条数据）")
+            m = None
+            ef_construction = None
+        else:
+            lists = None
+            m = st.number_input("m 参数", value=16, min_value=2, max_value=100,
+                                help="连接数，默认16，值越大召回率越高但构建越慢")
+            ef_construction = st.number_input("ef_construction 参数", value=200, min_value=40, max_value=2000,
+                                              help="构建时搜索深度，默认200，值越大召回率越高但构建越慢")
+
+        index_exists = vector_store.check_index_exists(selected_table, selected_index)
+
+        if index_exists:
+            st.info(f"索引 {selected_index} 已存在，如需重建请先删除")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("删除现有索引"):
+                    if vector_store.drop_vector_index(selected_index):
+                        st.success(f"索引 {selected_index} 已删除")
+                        st.rerun()
+
+        if st.button("创建索引", type="primary"):
+            if index_exists:
+                st.warning("索引已存在，请先删除再创建")
+            else:
+                start_time = time.time()
+                start_datetime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                with st.spinner("正在创建索引..."):
+                    success = vector_store.create_vector_index(
+                        table_name=selected_table,
+                        index_name=selected_index,
+                        index_type=index_type,
+                        lists=lists,
+                        m=m,
+                        ef_construction=ef_construction,
+                        maintenance_work_mem=maintenance_work_mem
+                    )
+                end_datetime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                execution_time = time.time() - start_time
+
+                if success:
+                    st.success(f"索引 {selected_index} 创建成功")
+                    st.text(f"开始时间: {start_datetime}")
+                    st.text(f"结束时间: {end_datetime}")
+                    st.text(f"执行耗时: {format_time(execution_time)}")
+                else:
+                    st.error("索引创建失败，请查看日志")
+
     db_conn.close()
 
-def process_enterprise_vectorization(enterprise_table, enterprise_id_col, enterprise_name_col, enterprise_address_col, batch_size, device=None):
-    if not enterprise_table or not enterprise_id_col or not enterprise_name_col or not enterprise_address_col:
-        st.error("请先选择企业表和对应的字段")
-        return
-    
-    if device is None:
-        device = st.session_state.get('selected_device', 'cpu')
-    
-    db_config = st.session_state.db_config
-    if not db_config.get('host') or not db_config.get('dbname'):
-        st.error("请先配置并连接数据库")
-        return
-    
+
+def _init_vec_status():
+    """初始化向量化状态"""
+    return {
+        'is_running': False,
+        'table_type': '',
+        'cancel_requested': False,
+        'processed_count': 0,
+        'total_count': 0,
+        'progress': 0.0,
+        'speed': 0.0,
+        'elapsed': 0.0,
+        'remaining': 0.0,
+        'status_message': '',
+        'error_message': '',
+        'completed': False,
+        'cancelled': False,
+        'start_datetime': '',
+        'end_datetime': '',
+        'execution_time': 0.0
+    }
+
+
+def _init_index_status():
+    """初始化索引创建状态"""
+    return {
+        'is_running': False,
+        'completed': False,
+        'error_message': '',
+        'start_datetime': '',
+        'end_datetime': '',
+        'execution_time': 0.0,
+        'start_time': 0.0
+    }
+
+
+def _start_vectorization(table_type, batch_size, device):
+    """启动向量化后台线程"""
+    vec_status = _init_vec_status()
+    vec_status['is_running'] = True
+    vec_status['table_type'] = table_type
+    st.session_state.vec_status = vec_status
+
+    # 将 vec_status 引用直接传给后台线程（线程中无法访问 st.session_state）
+    thread = threading.Thread(
+        target=run_vectorization_background,
+        args=(vec_status, st.session_state.db_config.copy(), st.session_state.vec_config.copy(),
+              table_type, batch_size, device),
+        daemon=True
+    )
+    thread.start()
+
+
+def run_vectorization_background(vec_status, db_config, vec_config, table_type, batch_size, device):
+    """后台运行向量化（vec_status 由主线程传入，线程内直接操作）"""
+    working_conn = None
     start_time = time.time()
-    start_datetime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-    
-    status_container = st.empty()
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    speed_text = st.empty()
-    elapsed_text = st.empty()
-    eta_text = st.empty()
-    
-    status_container.info("开始企业表向量化处理...")
-    
+
     try:
-        status_container.info("连接数据库...")
+        vec_status['start_datetime'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        vec_status['status_message'] = '正在连接数据库...'
+        logger.info(f"[向量化] 启动: table_type={table_type}, batch_size={batch_size}, device={device}")
+
         working_conn = DBConnection(
             host=db_config['host'],
             port=db_config['port'],
@@ -617,248 +809,387 @@ def process_enterprise_vectorization(enterprise_table, enterprise_id_col, enterp
             user=db_config['user'],
             password=db_config['password']
         )
-        
+
         if not working_conn.connect():
-            status_container.error("无法连接数据库，请检查配置")
+            vec_status['error_message'] = '无法连接数据库'
+            vec_status['is_running'] = False
+            logger.error("[向量化] 数据库连接失败")
             return
-        
-        status_container.info("数据库连接成功")
-        
+
+        logger.info("[向量化] 数据库连接成功")
         working_data_loader = DataLoader(working_conn)
-        
-        status_container.info("获取有效地址数量...")
-        total_count = working_data_loader.get_valid_address_count(enterprise_table, enterprise_address_col)
-        status_container.write(f"有效地址数量: {total_count:,}")
-        
+
+        if table_type == 'enterprise':
+            source_table = vec_config['enterprise_table']
+            id_col = vec_config['enterprise_id_col']
+            name_col = vec_config['enterprise_name_col']
+            addr_col = vec_config['enterprise_address_col']
+            vec_table = Config.ENTERPRISE_VECTOR_TABLE
+        else:
+            source_table = vec_config['standard_table']
+            id_col = vec_config['standard_id_col']
+            addr_col = vec_config['standard_address_col']
+            room_col = vec_config['standard_room_col']
+            vec_table = Config.STANDARD_VECTOR_TABLE
+
+        logger.info(f"[向量化] 源表={source_table}, 目标向量表={vec_table}")
+
+        total_count = working_data_loader.get_valid_address_count(source_table, addr_col)
+        vec_status['total_count'] = total_count
+        vec_status['status_message'] = f'共 {total_count:,} 条地址待处理'
+        logger.info(f"[向量化] 有效地址数: {total_count}")
+
         if total_count == 0:
-            status_container.warning("企业表中没有有效的地址数据")
-            working_conn.close()
+            vec_status['error_message'] = '没有有效的地址数据'
+            vec_status['is_running'] = False
+            logger.warning("[向量化] 无有效地址数据")
             return
-        
-        estimated_batches = (total_count + batch_size - 1) // batch_size
-        status_container.write(f"预计处理批次: {estimated_batches:,} 批")
-        
-        status_container.info("加载向量化模型...（首次加载可能需要几分钟）")
+
+        vec_status['status_message'] = '正在加载向量化模型...'
         from model.embedding import AddressEmbedder
         import torch
+        actual_device = device
         if device == 'cuda' and not torch.cuda.is_available():
-            logger.warning("用户选择GPU模式但CUDA不可用，切换到CPU模式")
-            device = 'cpu'
-        embedder = AddressEmbedder(device=device)
-        model_load_time = time.time() - start_time
+            logger.warning("[向量化] GPU不可用，切换到CPU")
+            actual_device = 'cpu'
+        embedder = AddressEmbedder(device=actual_device)
         vector_dim = embedder.get_vector_dim()
-        status_container.info(f"向量化模型加载成功（耗时 {model_load_time:.2f} 秒）")
-        status_container.info(f"模型输出向量维度: {vector_dim}")
-        device_label = "🖥️ GPU模式运行" if device == 'cuda' else "💻 CPU模式运行"
-        st.caption(f"当前运行模式: {device_label}")
-        
-        status_container.info("检查企业向量表...")
+        logger.info(f"[向量化] 模型加载完成, dim={vector_dim}, device={actual_device}")
+
         working_vector_store = VectorStore(working_conn)
-        
-        existing_dim = working_vector_store.check_vector_table_dimension(Config.ENTERPRISE_VECTOR_TABLE)
+        existing_dim = working_vector_store.check_vector_table_dimension(vec_table)
         if existing_dim is not None and existing_dim != vector_dim:
-            status_container.warning(f"现有向量表维度({existing_dim})与模型输出维度({vector_dim})不匹配，将重建向量表")
-            working_vector_store.drop_vector_table(Config.ENTERPRISE_VECTOR_TABLE)
-        
-        working_vector_store.create_vector_table_with_dim(Config.ENTERPRISE_VECTOR_TABLE, vector_dim, table_type='enterprise')
-        
+            logger.warning(f"[向量化] 维度不匹配: 现有={existing_dim}, 模型={vector_dim}, 重建表")
+            working_vector_store.drop_vector_table(vec_table)
+
+        working_vector_store.create_vector_table_with_dim(vec_table, vector_dim, table_type=table_type)
+        logger.info(f"[向量化] 向量表 {vec_table} 就绪")
+
+        # ---- 批量导入优化：禁用 autovacuum 防止与 INSERT 争抢 I/O ----
+        vec_status['status_message'] = '正在优化批量导入环境...'
+        working_vector_store.disable_autovacuum(vec_table)
+
+        # 删除已存在的向量索引（导入完成后重建），避免插入时维护索引开销
+        # 索引名与 UI 创建索引时保持一致
+        if table_type == 'enterprise':
+            idx_name = 'idx_enterprise_vector'
+        else:
+            idx_name = 'idx_standard_vector'
+        if working_vector_store.check_index_exists(vec_table, idx_name):
+            logger.info(f"[向量化] 删除已有向量索引 {idx_name}，导入完成后重建")
+            working_vector_store.drop_vector_index(idx_name)
+        logger.info(f"[向量化] 批量导入环境就绪 (autovacuum=off, 无向量索引)")
+
         processed_count = 0
         batch_num = 0
-        
-        status_text.text(f"开始企业表向量化，共 {total_count:,} 条地址")
-        
-        for df in working_data_loader.load_enterprise_data(
-            enterprise_table, enterprise_id_col, enterprise_name_col, enterprise_address_col, batch_size
-        ):
+
+        if table_type == 'enterprise':
+            loader = working_data_loader.load_enterprise_data(
+                source_table, id_col, name_col, addr_col, batch_size
+            )
+        else:
+            loader = working_data_loader.load_standard_addresses(
+                source_table, id_col, addr_col, room_col, batch_size
+            )
+
+        for df in loader:
             batch_num += 1
-            
+            # 检查取消标志
+            if vec_status.get('cancel_requested'):
+                logger.info(f"[向量化] 收到取消请求, 批次={batch_num}, 已处理={processed_count}")
+                vec_status['status_message'] = '正在清空已写入数据...'
+                working_vector_store.truncate_vector_table(vec_table)
+                vec_status['cancelled'] = True
+                vec_status['is_running'] = False
+                vec_status['end_datetime'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                vec_status['execution_time'] = time.time() - start_time
+                vec_status['status_message'] = f'已取消，已清空 {vec_table} 表数据'
+                logger.info(f"[向量化] 已取消, 清空了 {vec_table}")
+                return
+
             addresses = df['address'].tolist()
             source_ids = df['id'].tolist()
-            names = df['name'].tolist()
-            
+
+            if table_type == 'enterprise':
+                extra = df['name'].tolist()
+            else:
+                extra = df.get('room_no', [''] * len(addresses)).tolist()
+
             vectors = embedder.encode(addresses)
-            working_vector_store.insert_vectors(vectors, source_ids, addresses, Config.ENTERPRISE_VECTOR_TABLE, names, table_type='enterprise')
-            
+            inserted = working_vector_store.insert_vectors(vectors, source_ids, addresses, vec_table, extra, table_type=table_type)
+
             processed_count += len(addresses)
-            progress = processed_count / total_count
-            progress_bar.progress(min(progress, 1.0))
-            
-            elapsed_time = time.time() - start_time
-            speed = processed_count / elapsed_time if elapsed_time > 0 else 0
-            
-            if speed > 0:
-                remaining = (total_count - processed_count) / speed
-                eta_text.text(f"⏳ 预计剩余时间: {format_time(remaining)}")
-            
-            elapsed_text.text(f"⏱ 已执行时间: {format_time(elapsed_time)}")
-            speed_text.text(f"⚡ 处理速度: {speed:.2f} 条/秒")
-            status_text.text(f"📦 批次 {batch_num}/{estimated_batches}: 已处理 {processed_count:,}/{total_count:,} ({progress * 100:.1f}%)")
-            
-            logger.info(f"Enterprise vectorized batch {batch_num}: {processed_count}/{total_count} addresses")
-        
-        status_container.info("创建企业向量索引...")
-        working_vector_store.create_vector_index(Config.ENTERPRISE_VECTOR_TABLE, 'idx_enterprise_vector')
-        
-        total_time = time.time() - start_time
-        end_datetime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        avg_speed = processed_count / total_time if total_time > 0 else 0
-        
-        status_text.text(f"企业表向量化完成！共处理 {processed_count:,} 条地址")
-        speed_text.text(f"平均处理速度: {avg_speed:.2f} 条/秒")
-        elapsed_text.text(f"总耗时: {format_time(total_time)}")
-        eta_text.text(f"开始时间: {start_datetime}")
-        status_container.success(f"企业表向量化完成！\n开始时间: {start_datetime}\n结束时间: {end_datetime}")
-        logger.info(f"Enterprise vectorization completed: {processed_count} addresses in {total_time:.2f} seconds")
-        
+            elapsed = time.time() - start_time
+            speed = processed_count / elapsed if elapsed > 0 else 0
+
+            vec_status['processed_count'] = processed_count
+            vec_status['progress'] = processed_count / total_count
+            vec_status['speed'] = speed
+            vec_status['elapsed'] = elapsed
+            vec_status['remaining'] = (total_count - processed_count) / speed if speed > 0 else 0
+            vec_status['status_message'] = f'批次 {batch_num}: {processed_count:,}/{total_count:,}'
+
+            if batch_num % 5 == 0:
+                logger.info(f"[向量化] 批次={batch_num}, 进度={processed_count}/{total_count}")
+
+        # ---- 批量导入完成：回收空间并恢复 autovacuum ----
+        vec_status['status_message'] = '正在 VACUUM ANALYZE...'
+        working_vector_store.vacuum_table(vec_table, analyze=True)
+        vec_status['status_message'] = '正在恢复 autovacuum...'
+        working_vector_store.enable_autovacuum(vec_table)
+        logger.info(f"[向量化] 表维护完成: VACUUM ANALYZE + autovacuum 已恢复")
+
+        vec_status['completed'] = True
+        vec_status['is_running'] = False
+        vec_status['end_datetime'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        vec_status['execution_time'] = time.time() - start_time
+        vec_status['status_message'] = f'向量化完成，共处理 {processed_count:,} 条地址'
+        logger.info(f"[向量化] 完成: {processed_count}条, 耗时{vec_status['execution_time']:.2f}s")
+
     except Exception as e:
-        st.error(f"企业表向量化失败: {str(e)}")
+        logger.error(f"[向量化] 异常: {e}")
         import traceback
-        st.write(f"详细错误: {traceback.format_exc()}")
-        logger.error(f"Enterprise vectorization failed: {str(e)}")
+        logger.error(f"[向量化] Traceback: {traceback.format_exc()}")
+        # 尝试更新状态
+        try:
+            if vec_status is not None:
+                vec_status['is_running'] = False
+                vec_status['error_message'] = str(e)
+        except Exception:
+            pass
+        # 回退：直接修改 session_state
+        try:
+            st.session_state.vec_status['is_running'] = False
+            st.session_state.vec_status['error_message'] = str(e)
+        except Exception:
+            pass
     finally:
-        if 'working_conn' in locals() and working_conn:
+        if working_conn:
+            try:
+                # 确保 autovacuum 一定恢复（包括取消/异常路径）
+                working_vector_store = VectorStore(working_conn)
+                working_vector_store.enable_autovacuum(vec_table)
+                logger.info(f"[向量化] finally: autovacuum 已恢复 ({vec_table})")
+            except Exception:
+                pass
+            try:
+                working_conn.close()
+            except Exception:
+                pass
+
+
+def _start_index_creation(db_config, table_name, index_name, index_type,
+                          lists, m, ef_construction, maintenance_work_mem):
+    """启动索引创建后台线程"""
+    st.session_state.index_status = _init_index_status()
+    st.session_state.index_status['is_running'] = True
+    st.session_state.index_status['start_datetime'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    st.session_state.index_status['start_time'] = time.time()
+
+    thread = threading.Thread(
+        target=run_index_creation_background,
+        args=(db_config.copy(), table_name, index_name, index_type,
+              lists, m, ef_construction, maintenance_work_mem),
+        daemon=True
+    )
+    thread.start()
+
+
+def run_index_creation_background(db_config, table_name, index_name, index_type,
+                                  lists, m, ef_construction, maintenance_work_mem):
+    """后台运行索引创建"""
+    index_status = st.session_state.index_status
+    working_conn = None
+    logger.info(f"[索引创建] 开始: table={table_name}, index={index_name}, type={index_type}")
+
+    try:
+        logger.info(f"[索引创建] 连接数据库 host={db_config.get('host')} dbname={db_config.get('dbname')}")
+        working_conn = DBConnection(
+            host=db_config['host'],
+            port=db_config['port'],
+            schema=db_config['schema'],
+            dbname=db_config['dbname'],
+            user=db_config['user'],
+            password=db_config['password']
+        )
+
+        if not working_conn.connect():
+            index_status['error_message'] = '无法连接数据库'
+            index_status['is_running'] = False
+            logger.error("[索引创建] 数据库连接失败")
+            return
+
+        logger.info("[索引创建] 数据库连接成功")
+        working_vector_store = VectorStore(working_conn)
+        row_count = working_vector_store.get_vector_count(table_name)
+        logger.info(f"[索引创建] 表 {table_name} 数据量: {row_count}")
+
+        success = working_vector_store.create_vector_index(
+            table_name=table_name,
+            index_name=index_name,
+            index_type=index_type,
+            lists=lists,
+            m=m,
+            ef_construction=ef_construction,
+            maintenance_work_mem=maintenance_work_mem
+        )
+
+        if success:
+            index_status['completed'] = True
+            index_status['end_datetime'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+            index_status['execution_time'] = time.time() - index_status['start_time']
+            logger.info(f"Index {index_name} created successfully in {index_status['execution_time']:.2f}s")
+        else:
+            index_status['error_message'] = '索引创建失败，请查看日志'
+            logger.error(f"[索引创建] create_vector_index 返回 False")
+    except Exception as e:
+        index_status['error_message'] = str(e)
+        logger.error(f"[索引创建] 异常: {e}")
+        import traceback
+        logger.error(f"[索引创建] Traceback: {traceback.format_exc()}")
+    finally:
+        index_status['is_running'] = False
+        logger.info(f"[索引创建] 线程结束, is_running={index_status['is_running']}, completed={index_status.get('completed')}, error={index_status.get('error_message')}")
+        if working_conn:
             working_conn.close()
 
-def process_standard_vectorization(standard_table, standard_id_col, standard_address_col, standard_room_col, batch_size, device=None):
-    if not standard_table or not standard_id_col or not standard_address_col:
-        st.error("请先选择标准地址表和对应的字段")
-        return
-    
-    if device is None:
-        device = st.session_state.get('selected_device', 'cpu')
-    
-    db_config = st.session_state.db_config
-    if not db_config.get('host') or not db_config.get('dbname'):
-        st.error("请先配置并连接数据库")
-        return
-    
-    start_time = time.time()
-    start_datetime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-    
-    status_container = st.empty()
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    speed_text = st.empty()
-    elapsed_text = st.empty()
-    eta_text = st.empty()
-    
-    status_container.info("开始标准地址表向量化处理...")
-    
-    try:
-        status_container.info("连接数据库...")
-        working_conn = DBConnection(
-            host=db_config['host'],
-            port=db_config['port'],
-            schema=db_config['schema'],
-            dbname=db_config['dbname'],
-            user=db_config['user'],
-            password=db_config['password']
-        )
-        
-        if not working_conn.connect():
-            status_container.error("无法连接数据库，请检查配置")
-            return
-        
-        status_container.info("数据库连接成功")
-        
-        working_data_loader = DataLoader(working_conn)
-        
-        status_container.info("获取有效地址数量...")
-        total_count = working_data_loader.get_valid_address_count(standard_table, standard_address_col)
-        status_container.write(f"有效地址数量: {total_count:,}")
-        
-        if total_count == 0:
-            status_container.warning("标准地址表中没有有效的地址数据")
-            working_conn.close()
-            return
-        
-        estimated_batches = (total_count + batch_size - 1) // batch_size
-        status_container.write(f"预计处理批次: {estimated_batches:,} 批")
-        
-        status_container.info("加载向量化模型...（首次加载可能需要几分钟）")
-        from model.embedding import AddressEmbedder
-        import torch
-        if device == 'cuda' and not torch.cuda.is_available():
-            logger.warning("用户选择GPU模式但CUDA不可用，切换到CPU模式")
-            device = 'cpu'
-        embedder = AddressEmbedder(device=device)
-        model_load_time = time.time() - start_time
-        vector_dim = embedder.get_vector_dim()
-        status_container.info(f"向量化模型加载成功（耗时 {model_load_time:.2f} 秒）")
-        status_container.info(f"模型输出向量维度: {vector_dim}")
-        device_label = "🖥️ GPU模式运行" if device == 'cuda' else "💻 CPU模式运行"
-        st.caption(f"当前运行模式: {device_label}")
-        
-        status_container.info("检查标准地址向量表...")
-        working_vector_store = VectorStore(working_conn)
-        
-        existing_dim = working_vector_store.check_vector_table_dimension(Config.STANDARD_VECTOR_TABLE)
-        if existing_dim is not None and existing_dim != vector_dim:
-            status_container.warning(f"现有向量表维度({existing_dim})与模型输出维度({vector_dim})不匹配，将重建向量表")
-            working_vector_store.drop_vector_table(Config.STANDARD_VECTOR_TABLE)
-        
-        working_vector_store.create_vector_table_with_dim(Config.STANDARD_VECTOR_TABLE, vector_dim, table_type='standard')
-        
-        processed_count = 0
-        batch_num = 0
-        
-        status_text.text(f"开始标准地址表向量化，共 {total_count:,} 条地址")
-        
-        for df in working_data_loader.load_standard_addresses(standard_table, standard_id_col, standard_address_col, standard_room_col, batch_size):
-            batch_num += 1
-            
-            addresses = df['address'].tolist()
-            source_ids = df['id'].tolist()
-            room_nos = df.get('room_no', [''] * len(addresses)).tolist()
-            
-            vectors = embedder.encode(addresses)
-            working_vector_store.insert_vectors(vectors, source_ids, addresses, Config.STANDARD_VECTOR_TABLE, room_nos, table_type='standard')
-            
-            processed_count += len(addresses)
-            progress = processed_count / total_count
-            progress_bar.progress(min(progress, 1.0))
-            
-            elapsed_time = time.time() - start_time
-            speed = processed_count / elapsed_time if elapsed_time > 0 else 0
-            
-            if speed > 0:
-                remaining = (total_count - processed_count) / speed
-                eta_text.text(f"⏳ 预计剩余时间: {format_time(remaining)}")
-            
-            elapsed_text.text(f"⏱ 已执行时间: {format_time(elapsed_time)}")
-            speed_text.text(f"⚡ 处理速度: {speed:.2f} 条/秒")
-            status_text.text(f"📦 批次 {batch_num}/{estimated_batches}: 已处理 {processed_count:,}/{total_count:,} ({progress * 100:.1f}%)")
-            
-            logger.info(f"Standard vectorized batch {batch_num}: {processed_count}/{total_count} addresses")
-        
-        status_container.info("创建标准地址向量索引...")
-        working_vector_store.create_vector_index(Config.STANDARD_VECTOR_TABLE, 'idx_standard_vector')
-        
-        total_time = time.time() - start_time
-        end_datetime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        avg_speed = processed_count / total_time if total_time > 0 else 0
-        
-        status_text.text(f"标准地址表向量化完成！共处理 {processed_count:,} 条地址")
-        speed_text.text(f"平均处理速度: {avg_speed:.2f} 条/秒")
-        elapsed_text.text(f"总耗时: {format_time(total_time)}")
-        eta_text.text(f"开始时间: {start_datetime}")
-        status_container.success(f"标准地址表向量化完成！\n开始时间: {start_datetime}\n结束时间: {end_datetime}")
-        logger.info(f"Standard address vectorization completed: {processed_count} addresses in {total_time:.2f} seconds")
-        
-    except Exception as e:
-        st.error(f"标准地址表向量化失败: {str(e)}")
-        import traceback
-        st.write(f"详细错误: {traceback.format_exc()}")
-        logger.error(f"Standard address vectorization failed: {str(e)}")
-    finally:
-        if 'working_conn' in locals() and working_conn:
-            working_conn.close()
 
 def show_address_matching():
     db_config = st.session_state.db_config
     
     device = _render_device_selector(key='match_device_selector')
-    
+
+    # ========== 标签选择 ==========
+    st.markdown(f"<div class='status-card status-card-info'>", unsafe_allow_html=True)
+    st.subheader("标签管理")
+
+    if not st.session_state.connected:
+        st.warning("请先在【数据库配置】页面连接数据库")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    tag_db_conn = DBConnection(
+        host=db_config['host'], port=db_config['port'],
+        schema=db_config['schema'], dbname=db_config['dbname'],
+        user=db_config['user'], password=db_config['password']
+    )
+    if not tag_db_conn.connect():
+        st.error("无法连接数据库")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    tag_mgr = TagManager(tag_db_conn)
+    all_tags = tag_mgr.get_all_tags()
+
+    tag_col1, tag_col2, tag_col3 = st.columns([2, 2, 1])
+
+    with tag_col1:
+        # 构建标签选项：显示 tag_name，值为 prefix
+        tag_names = ['-- 选择已有标签 --'] + [t['tag_name'] for t in all_tags] + ['+ 新建标签']
+        current_prefix = st.session_state.get('current_tag_prefix', '')
+        default_idx = 0
+        for i, t in enumerate(all_tags):
+            if t['prefix'] == current_prefix:
+                default_idx = i + 1
+                break
+
+        selected_tag_option = st.selectbox(
+            "选择匹配标签",
+            tag_names,
+            index=min(default_idx, len(tag_names) - 1),
+            key='tag_selector'
+        )
+
+    with tag_col2:
+        custom_tag = ''
+        if selected_tag_option == '+ 新建标签':
+            custom_tag = st.text_input("输入新标签（支持中文/英文）", key='custom_tag_input',
+                                       placeholder="例如：福田 或 batch1")
+
+    with tag_col3:
+        st.write("")
+        st.write("")
+        if st.button("✔️ 确定", key='confirm_tag'):
+            if selected_tag_option == '+ 新建标签' and custom_tag:
+                # 通过 TagManager 创建标签（持久化到 match_tags 表 + 创建数据表）
+                result = tag_mgr.create_tag(custom_tag.strip())
+                if result:
+                    st.session_state.current_tag = result['tag_name']
+                    st.session_state.current_tag_prefix = result['prefix']
+                    st.session_state.current_recall_table = result['recall_table']
+                    st.session_state.current_match_table = result['match_table']
+                    st.success(f"标签已创建并持久化: {result['tag_name']} → {result['recall_table']}, {result['match_table']}")
+                else:
+                    st.error("创建标签失败，可能已存在同名标签")
+                st.rerun()
+            elif selected_tag_option not in ('-- 选择已有标签 --', '+ 新建标签'):
+                # 找到对应的 tag 信息
+                selected_prefix = None
+                selected_recall = None
+                selected_match = None
+                for t in all_tags:
+                    if t['tag_name'] == selected_tag_option:
+                        selected_prefix = t['prefix']
+                        selected_recall = t['recall_table']
+                        selected_match = t['match_table']
+                        break
+                if selected_prefix:
+                    st.session_state.current_tag = selected_tag_option
+                    st.session_state.current_tag_prefix = selected_prefix
+                    st.session_state.current_recall_table = selected_recall
+                    st.session_state.current_match_table = selected_match
+                    st.success(f"已选择标签: {selected_tag_option}")
+                st.rerun()
+            else:
+                st.warning("请选择已有标签或输入新标签")
+
+    # 显示当前标签信息
+    if st.session_state.current_tag:
+        recall_tbl = st.session_state.current_recall_table
+        match_tbl = st.session_state.current_match_table
+        st.info(f"**当前标签**: {st.session_state.current_tag} | **召回表**: {recall_tbl} | **匹配表**: {match_tbl}")
+
+    # 删除标签
+    if all_tags:
+        with st.expander("删除标签（同时删除对应数据表）"):
+            del_options = [t['tag_name'] for t in all_tags]
+            del_col1, del_col2 = st.columns([2, 1])
+            with del_col1:
+                del_tag_name = st.selectbox("选择要删除的标签", del_options, key='del_tag_selector')
+            with del_col2:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ 删除标签", key='delete_tag_btn', type="secondary"):
+                    del_prefix = None
+                    for t in all_tags:
+                        if t['tag_name'] == del_tag_name:
+                            del_prefix = t['prefix']
+                            break
+                    if del_prefix:
+                        try:
+                            tag_mgr.delete_tag(del_prefix)
+                            if st.session_state.current_tag_prefix == del_prefix:
+                                st.session_state.current_tag = ''
+                                st.session_state.current_tag_prefix = ''
+                                st.session_state.current_recall_table = Config.RECALL_RESULTS_TABLE
+                                st.session_state.current_match_table = Config.MATCH_RESULTS_TABLE
+                            st.success(f"标签 '{del_tag_name}' 及相关表已删除")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"删除失败: {e}")
+
+    tag_db_conn.close()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # 未设置标签时不允许匹配
+    if not st.session_state.current_tag:
+        st.warning("请先选择或创建一个标签，再进行地址匹配")
+        return
+
+    # 使用标签对应的表名
+    _recall_table = st.session_state.current_recall_table
+    _match_table = st.session_state.current_match_table
+
     # 确保 matching_status 已初始化
     if 'matching_status' not in st.session_state:
         st.session_state.matching_status = {
@@ -928,7 +1259,7 @@ def show_address_matching():
                     password=db_config['password']
                 )
                 if check_conn.connect():
-                    recall_table = Config.RECALL_RESULTS_TABLE
+                    recall_table = _recall_table
                     # 查询企业数量（去重）
                     enterprise_cursor = check_conn.execute(f"SELECT COUNT(DISTINCT enterprise_id) FROM {recall_table}")
                     enterprise_count = enterprise_cursor.fetchone()['count'] if enterprise_cursor else 0
@@ -1038,8 +1369,8 @@ def show_address_matching():
             except Exception as e:
                 logger.error(f"获取匹配器状态失败: {e}")
         
-        st.markdown("<div style='background-color: #fef3c7; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>", unsafe_allow_html=True)
-        st.subheader("📊 匹配执行状态")
+        st.markdown(f"<div class='status-card status-card-warning'>", unsafe_allow_html=True)
+        st.subheader("匹配执行状态")
         
         # 判断当前阶段
         is_recall_stage = matching_status['current_stage'] == '数据粗召回' or matching_status['current_stage'] == '数据粗召回完成'
@@ -1142,8 +1473,8 @@ def show_address_matching():
     
     # 粗召回完成后，显示结果和下一步操作按钮（但如果正在运行精排任务或已完成精排，则不显示）
     if recall_status['completed'] and not matching_status['ranking_completed'] and not matching_status['is_running'] and matching_status.get('current_stage') != 'MGeo精确匹配':
-        st.markdown("<div style='background-color: #d1fae5; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>", unsafe_allow_html=True)
-        st.subheader("✅ 数据粗召回匹配完成")
+        st.markdown(f"<div class='status-card status-card-success'>", unsafe_allow_html=True)
+        st.subheader("数据粗召回匹配完成")
         
         if recall_status['start_time'] and recall_status['end_time']:
             duration = recall_status['end_time'] - recall_status['start_time']
@@ -1190,7 +1521,7 @@ def show_address_matching():
                 )
                 if db_conn.connect():
                     data_loader = DataLoader(db_conn)
-                    data_loader.truncate_recall_table()
+                    data_loader.truncate_recall_table(_recall_table)
                     db_conn.close()
                     st.info("已清空召回结果表")
             except Exception as e:
@@ -1211,8 +1542,8 @@ def show_address_matching():
     
     # 精排完成后，显示最终结果
     if matching_status['ranking_completed']:
-        st.markdown("<div style='background-color: #dbeafe; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>", unsafe_allow_html=True)
-        st.subheader("✅ MGeo精确匹配完成")
+        st.markdown(f"<div class='status-card status-card-info'>", unsafe_allow_html=True)
+        st.subheader("MGeo精确匹配完成")
         st.write(f"**匹配结果数**: {matching_status['match_count']:,}")
         
         col1, col2, col3 = st.columns(3)
@@ -1236,8 +1567,8 @@ def show_address_matching():
         return
     
     # 上部分：数据粗召回匹配
-    st.markdown("<div style='background-color: #f0fdf4; padding: 20px; border-radius: 10px; margin-bottom: 20px;'>", unsafe_allow_html=True)
-    st.subheader("🔍 数据粗召回匹配")
+    st.markdown(f"<div class='status-card status-card-success'>", unsafe_allow_html=True)
+    st.subheader("数据粗召回匹配")
     
     if not st.session_state.connected:
         st.warning("⚠️ 数据粗召回匹配需要数据库连接，请先在【数据库配置】页面配置并连接数据库")
@@ -1314,8 +1645,8 @@ def show_address_matching():
     st.markdown("</div>", unsafe_allow_html=True)
     
     # 下部分：MGeo精确匹配
-    st.markdown("<div style='background-color: #fef3c7; padding: 20px; border-radius: 10px;'>", unsafe_allow_html=True)
-    st.subheader("🎯 MGeo精确匹配")
+    st.markdown(f"<div class='status-card status-card-warning'>", unsafe_allow_html=True)
+    st.subheader("MGeo精确匹配")
     
     if not st.session_state.connected:
         st.warning("⚠️ MGeo精确匹配需要数据库连接，请先在【数据库配置】页面配置并连接数据库")
@@ -1330,7 +1661,7 @@ def show_address_matching():
                 password=db_config['password']
             )
             if check_conn.connect():
-                recall_cursor = check_conn.execute(f"SELECT COUNT(*) FROM {Config.RECALL_RESULTS_TABLE}")
+                recall_cursor = check_conn.execute(f"SELECT COUNT(*) FROM {_recall_table}")
                 recall_count = recall_cursor.fetchone()['count'] if recall_cursor else 0
                 check_conn.close()
                 
@@ -1362,8 +1693,8 @@ def show_mgeo_similarity_matching(db_config, device):
         3. 匹配执行：显示进度、时间等信息
         4. 结果查看：匹配完成后跳转至结果管理
     """
-    st.markdown("<div style='background-color: #ede9fe; padding: 20px; border-radius: 10px;'>", unsafe_allow_html=True)
-    st.subheader("🔗 MGeo地址相似度匹配")
+    st.markdown(f"<div class='status-card status-card-info'>", unsafe_allow_html=True)
+    st.subheader("MGeo地址相似度匹配")
     st.caption("独立匹配功能：直接调用MGeo模型对地址A和地址B进行相似度匹配，无需向量召回")
 
     sim_device = _render_device_selector(key='mgeo_sim_device_selector')
@@ -1443,8 +1774,8 @@ def show_mgeo_similarity_matching(db_config, device):
             except Exception as e:
                 logger.error(f"获取MGeo相似度匹配状态失败: {e}")
 
-        st.markdown("<div style='background-color: #fef3c7; padding: 15px; border-radius: 8px; margin-bottom: 15px;'>", unsafe_allow_html=True)
-        st.subheader("📊 MGeo相似度匹配执行状态")
+        st.markdown(f"<div class='status-card status-card-warning'>", unsafe_allow_html=True)
+        st.subheader("MGeo相似度匹配执行状态")
 
         if mgeo_sim_status['start_time']:
             start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mgeo_sim_status['start_time']))
@@ -1479,8 +1810,8 @@ def show_mgeo_similarity_matching(db_config, device):
 
     # 如果匹配完成，显示结果
     if mgeo_sim_status['completed']:
-        st.markdown("<div style='background-color: #d1fae5; padding: 15px; border-radius: 8px; margin-bottom: 15px;'>", unsafe_allow_html=True)
-        st.subheader("✅ MGeo地址相似度匹配完成")
+        st.markdown(f"<div class='status-card status-card-success'>", unsafe_allow_html=True)
+        st.subheader("MGeo地址相似度匹配完成")
 
         if mgeo_sim_status['start_time'] and mgeo_sim_status['end_time']:
             duration = mgeo_sim_status['end_time'] - mgeo_sim_status['start_time']
@@ -1496,7 +1827,7 @@ def show_mgeo_similarity_matching(db_config, device):
             if 'mgeo_sim_match_results' in st.session_state and st.session_state.mgeo_sim_match_results:
                 result_df = pd.DataFrame(st.session_state.mgeo_sim_match_results)
                 
-                st.subheader("📥 结果下载")
+                st.subheader("结果下载")
                 dl_col1, dl_col2 = st.columns(2)
                 with dl_col1:
                     try:
@@ -1927,6 +2258,14 @@ def reset_matching_status():
 
 def start_recall_matching(db_config, device, enterprise_vector_table, standard_vector_table):
     """启动粗召回匹配"""
+    # 防止重复启动
+    if st.session_state.matching_status.get('is_running'):
+        st.warning("匹配任务已在运行中，请等待完成")
+        return
+    if st.session_state.get('ranking_thread') and st.session_state.ranking_thread.is_alive():
+        st.warning("精排任务正在运行中，请等待完成")
+        return
+
     try:
         from matching.matcher import AddressMatcher
         
@@ -2020,7 +2359,8 @@ def start_recall_matching(db_config, device, enterprise_vector_table, standard_v
             standard_table=standard_vector_table,
             top_n=st.session_state.matching_config['recall_top_n'],
             progress_callback=None,
-            completed_callback=on_recall_completed
+            completed_callback=on_recall_completed,
+            recall_table=st.session_state.current_recall_table
         )
         
         st.success("粗召回匹配任务已启动！")
@@ -2034,9 +2374,20 @@ def start_recall_matching(db_config, device, enterprise_vector_table, standard_v
 
 def start_mgeo_ranking(db_config, device):
     """启动MGeo精确匹配"""
+    # 防止重复启动
+    if st.session_state.matching_status.get('is_running'):
+        st.warning("匹配任务已在运行中，请等待完成")
+        return
+    if st.session_state.get('ranking_thread') and st.session_state.ranking_thread.is_alive():
+        st.warning("精排任务已在运行中，请等待完成")
+        return
+
     try:
         start_time = time.time()
         threshold = st.session_state.matching_config['similarity_threshold']
+        # 获取标签对应的表名
+        recall_table = st.session_state.current_recall_table
+        match_table = st.session_state.current_match_table
         
         logger.info("[start_mgeo_ranking] 开始启动MGeo精排...")
         logger.info(f"[start_mgeo_ranking] 相似度阈值: {threshold}")
@@ -2114,7 +2465,8 @@ def start_mgeo_ranking(db_config, device):
         }
         
         # 启动后台线程执行MGeo精排（模型加载和数据库操作都在后台线程中完成）
-        def ranking_thread_func(inner_db_config, inner_device, inner_threshold, inner_ranking_status, inner_start_time):
+        def ranking_thread_func(inner_db_config, inner_device, inner_threshold, inner_ranking_status, inner_start_time,
+                                inner_recall_table, inner_match_table):
             """MGeo精排后台线程"""
             db_conn = None
             try:
@@ -2138,15 +2490,15 @@ def start_mgeo_ranking(db_config, device):
                     return
                 
                 data_loader = DataLoader(db_conn)
-                
+
                 # 确保结果表存在
-                data_loader.create_result_table()
-                data_loader.truncate_result_table()
-                logger.info("[ranking_thread_func] 已清空match_results表")
-                
+                data_loader.create_result_table(inner_match_table)
+                data_loader.truncate_result_table(inner_match_table)
+                logger.info(f"[ranking_thread_func] 已清空 {inner_match_table}")
+
                 # 从recall_results表加载召回结果
-                logger.info("[MGeo精排] 加载召回结果...")
-                recall_results = data_loader.load_recall_results()
+                logger.info(f"[MGeo精排] 加载召回结果 {inner_recall_table}...")
+                recall_results = data_loader.load_recall_results(inner_recall_table)
                 total = len(recall_results)
                 inner_ranking_status.total_count = total
                 
@@ -2310,13 +2662,11 @@ def start_mgeo_ranking(db_config, device):
                     )
                     
                     if len(final_results) >= 100:
-                        inserted = data_loader.insert_match_results(final_results)
-                        logger.info(f"[MGeo精排] 已插入 {inserted} 条匹配结果")
+                        inserted = data_loader.insert_match_results(final_results, inner_match_table)
                         final_results = []
-                
+
                 if final_results:
-                    inserted = data_loader.insert_match_results(final_results)
-                    logger.info(f"[MGeo精排] 最终插入 {inserted} 条匹配结果")
+                    inserted = data_loader.insert_match_results(final_results, inner_match_table)
                 
                 total_time = time.time() - inner_start_time
                 logger.info(f"[MGeo精排] 完成！总耗时: {total_time:.2f}s, 处理企业数: {processed_count}")
@@ -2349,7 +2699,7 @@ def start_mgeo_ranking(db_config, device):
                         pass
         
         # 启动后台线程
-        ranking_thread = threading.Thread(target=ranking_thread_func, args=(db_config, device, threshold, ranking_status, start_time), daemon=True)
+        ranking_thread = threading.Thread(target=ranking_thread_func, args=(db_config, device, threshold, ranking_status, start_time, recall_table, match_table), daemon=True)
         ranking_thread.start()
         st.session_state.ranking_thread = ranking_thread
         
@@ -2365,7 +2715,7 @@ def start_mgeo_ranking(db_config, device):
 def show_result_management():
     """
     结果管理页面
-    
+
     功能：
         1. 粗召回数据浏览与导出
         2. 精排匹配结果浏览、筛选与导出
@@ -2375,7 +2725,7 @@ def show_result_management():
     if not st.session_state.connected:
         st.warning("⚠️ 结果管理功能需要数据库连接，请先在【数据库配置】页面配置并连接数据库")
         return
-    
+
     db_config = st.session_state.db_config
     db_conn = DBConnection(
         host=db_config['host'],
@@ -2385,15 +2735,52 @@ def show_result_management():
         user=db_config['user'],
         password=db_config['password']
     )
-    
+
     if not db_conn.connect():
         st.error("无法连接数据库，请检查配置")
         return
-    
+
     data_loader = DataLoader(db_conn)
-    
-    data_loader.create_recall_table()
-    data_loader.create_result_table()
+
+    # ========== 标签选择 ==========
+    tag_mgr = TagManager(db_conn)
+    all_tags = tag_mgr.get_all_tags()
+
+    col_tag, col_space = st.columns([1, 2])
+    with col_tag:
+        tag_display_names = ['默认（无标签）'] + [t['tag_name'] for t in all_tags]
+        result_tag_idx = 0
+        current_tag_prefix = st.session_state.get('current_tag_prefix', '')
+        for i, t in enumerate(all_tags):
+            if t['prefix'] == current_tag_prefix:
+                result_tag_idx = i + 1
+                break
+
+        selected_result_tag = st.selectbox(
+            "选择标签（筛选粗召回和精排数据）",
+            tag_display_names,
+            index=min(result_tag_idx, len(tag_display_names) - 1),
+            key='result_tag_selector',
+            help="选择不同标签查看对应的匹配结果"
+        )
+
+    # 确定当前使用的表名
+    if selected_result_tag == '默认（无标签）':
+        result_recall_table = Config.RECALL_RESULTS_TABLE
+        result_match_table = Config.MATCH_RESULTS_TABLE
+    else:
+        for t in all_tags:
+            if t['tag_name'] == selected_result_tag:
+                result_recall_table = t['recall_table']
+                result_match_table = t['match_table']
+                break
+        else:
+            result_recall_table = Config.RECALL_RESULTS_TABLE
+            result_match_table = Config.MATCH_RESULTS_TABLE
+
+    # 确保标签对应的表存在
+    data_loader.create_recall_table(result_recall_table)
+    data_loader.create_result_table(result_match_table)
     
     active_tab_name = st.session_state.get('result_management_active_tab', None)
     if 'result_management_active_tab' in st.session_state:
@@ -2421,7 +2808,7 @@ def show_result_management():
         
         if st.session_state.manual_correction_mode:
             st.markdown("""
-            <div style='background-color: #fff3cd; padding: 12px; border-radius: 8px; border-left: 4px solid #ffc107; margin-bottom: 16px;'>
+            <div class='status-card status-card-warning'>
                 <strong>⚠️ 人工纠正模式</strong>：请选择需要更改的数据，勾选后点击"标记为精确匹配"按钮
             </div>
             """, unsafe_allow_html=True)
@@ -2429,7 +2816,7 @@ def show_result_management():
             enterprise_ids = st.session_state.manual_correction_enterprise_ids
             
             try:
-                recall_df = data_loader.get_recall_results_by_enterprise_ids(enterprise_ids)
+                recall_df = data_loader.get_recall_results_by_enterprise_ids(enterprise_ids, table_name=result_recall_table)
                 
                 if not recall_df.empty:
                     st.info(f"已筛选出 {len(recall_df)} 条粗召回数据（涉及 {len(enterprise_ids)} 个企业）")
@@ -2479,7 +2866,7 @@ def show_result_management():
                     if st.session_state.get('show_correction_confirm', False):
                         correction_data = st.session_state.get('pending_correction_data', [])
                         st.markdown("""
-                        <div style='background-color: #d1ecf1; padding: 12px; border-radius: 8px; border-left: 4px solid #0dcaf0; margin: 10px 0;'>
+                        <div class='status-card status-card-info'>
                             <strong>🔔 确认操作</strong>：将 {count} 条数据标记为精确匹配，此操作将更新精排匹配结果中对应企业的匹配数据。
                         </div>
                         """.format(count=len(correction_data)), unsafe_allow_html=True)
@@ -2487,7 +2874,7 @@ def show_result_management():
                         confirm_btn_col1, confirm_btn_col2 = st.columns(2)
                         with confirm_btn_col1:
                             if st.button("✔️ 确认提交", key='confirm_correction_submit', type="primary"):
-                                success_count = data_loader.batch_update_match_results_with_correction(correction_data)
+                                success_count = data_loader.batch_update_match_results_with_correction(correction_data, table_name=result_match_table)
                                 st.session_state.manual_correction_mode = False
                                 st.session_state.manual_correction_enterprise_ids = []
                                 st.session_state.show_correction_confirm = False
@@ -2537,7 +2924,7 @@ def show_result_management():
                 recall_filters['max_similarity'] = recall_max_sim
             
             try:
-                total = data_loader.get_recall_results_count(filters=recall_filters)
+                total = data_loader.get_recall_results_count(table_name=result_recall_table, filters=recall_filters)
                 
                 if total > 0:
                     col1, col2, col3 = st.columns([2, 3, 2])
@@ -2580,6 +2967,7 @@ def show_result_management():
                     
                     offset = (page - 1) * page_size
                     results = data_loader.get_recall_results_paginated(
+                        table_name=result_recall_table,
                         filters=recall_filters,
                         page=page,
                         page_size=page_size
@@ -2601,7 +2989,7 @@ def show_result_management():
                                 buffer = io.StringIO()
                                 first_batch = True
                                 batch_count = 0
-                                for batch_df in data_loader.export_recall_results_batch(batch_size=5000):
+                                for batch_df in data_loader.export_recall_results_batch(batch_size=5000, table_name=result_recall_table):
                                     batch_df.to_csv(buffer, index=False, header=first_batch, encoding='utf-8-sig')
                                     first_batch = False
                                     batch_count += 1
@@ -2623,7 +3011,7 @@ def show_result_management():
                                 buffer = io.BytesIO()
                                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                                     batch_idx = 0
-                                    for batch_df in data_loader.export_recall_results_batch(batch_size=5000):
+                                    for batch_df in data_loader.export_recall_results_batch(batch_size=5000, table_name=result_recall_table):
                                         sheet_name = f'数据_{batch_idx + 1}' if batch_idx < 26 else f'S{batch_idx + 1}'
                                         batch_df.to_excel(writer, sheet_name=sheet_name, index=False)
                                         batch_idx += 1
@@ -2689,7 +3077,7 @@ def show_result_management():
             filters['keyword'] = keyword
         
         try:
-            total = data_loader.get_match_results_count(filters=filters)
+            total = data_loader.get_match_results_count(table_name=result_match_table, filters=filters)
             
             if total > 0:
                 col1, col2, col3 = st.columns([2, 3, 2])
@@ -2732,6 +3120,7 @@ def show_result_management():
                 
                 offset = (page - 1) * page_size
                 results = data_loader.get_match_results_paginated(
+                    table_name=result_match_table,
                     filters=filters,
                     page=page,
                     page_size=page_size
@@ -2766,7 +3155,7 @@ def show_result_management():
                             buffer = io.StringIO()
                             first_batch = True
                             batch_count = 0
-                            for batch_df in data_loader.export_match_results_batch(filters=filters, batch_size=5000):
+                            for batch_df in data_loader.export_match_results_batch(table_name=result_match_table, filters=filters, batch_size=5000):
                                 batch_df.to_csv(buffer, index=False, header=first_batch, encoding='utf-8-sig')
                                 first_batch = False
                                 batch_count += 1
@@ -2788,7 +3177,7 @@ def show_result_management():
                             buffer = io.BytesIO()
                             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                                 batch_idx = 0
-                                for batch_df in data_loader.export_match_results_batch(filters=filters, batch_size=5000):
+                                for batch_df in data_loader.export_match_results_batch(table_name=result_match_table, filters=filters, batch_size=5000):
                                     sheet_name = f'数据_{batch_idx + 1}' if batch_idx < 26 else f'S{batch_idx + 1}'
                                     batch_df.to_excel(writer, sheet_name=sheet_name, index=False)
                                     batch_idx += 1
@@ -2810,7 +3199,7 @@ def show_result_management():
             
             st.divider()
             st.subheader("匹配统计")
-            stats = data_loader.get_match_statistics()
+            stats = data_loader.get_match_statistics(table_name=result_match_table)
             
             stat_col1, stat_col2, stat_col3, stat_col4, stat_col5 = st.columns(5)
             stat_col1.metric("总记录数", f"{stats['total_count']:,}")
@@ -3069,7 +3458,7 @@ def show_result_management():
             st.error(f"查询MGeo相似度匹配结果出错: {e}")
 
         st.divider()
-        st.subheader("📋 MGeo副本表查看")
+        st.subheader("MGeo副本表查看")
         try:
             all_tables = db_conn.get_tables() if hasattr(db_conn, 'get_tables') else []
             if not all_tables:
@@ -3168,43 +3557,66 @@ def show_result_management():
 
 def show_system_logs():
     st.subheader("系统日志")
-    
+
     # 显示内存中的日志（实时）
-    from utils.logger import get_log_messages, clear_logs
-    
+    from utils.logger import get_log_messages, clear_logs, get_db_logs, clear_db_logs
+
     log_messages = get_log_messages()
     if log_messages:
-        # 格式化内存日志
         memory_logs = []
-        for log in log_messages[-500:]:  # 只显示最近500条
+        for log in log_messages[-500:]:
             time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(log['time']))
             memory_logs.append(f"{time_str} - {log['level']} - {log['message']}")
-        
+
         memory_content = '\n'.join(memory_logs)
         st.text_area("实时日志（内存）", memory_content, height=300)
-        
+
         if st.button("清空内存日志"):
             clear_logs()
             st.rerun()
     else:
         st.info("暂无内存日志")
-    
+
     st.divider()
-    
-    # 显示文件日志
-    st.subheader("文件日志")
-    try:
-        with open('app.log', 'r', encoding='utf-8') as f:
-            content = f.read()
-            if content:
-                st.text_area("日志文件内容", content, height=300)
+
+    # 显示数据库日志
+    st.subheader("数据库存储日志")
+    if st.session_state.connected:
+        db_config = st.session_state.db_config
+        db_conn = DBConnection(
+            host=db_config['host'],
+            port=db_config['port'],
+            schema=db_config['schema'],
+            dbname=db_config['dbname'],
+            user=db_config['user'],
+            password=db_config['password']
+        )
+        if db_conn.connect():
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                log_level_filter = st.selectbox("日志级别", ['全部', 'WARNING', 'ERROR'], key='db_log_level')
+            with col2:
+                st.write("")
+                st.write("")
+                if st.button("清空数据库日志"):
+                    clear_db_logs(db_conn)
+                    st.success("数据库日志已清空")
+                    st.rerun()
+
+            level = None if log_level_filter == '全部' else log_level_filter
+            db_logs = get_db_logs(db_conn, limit=500, level=level)
+            if db_logs:
+                log_lines = []
+                for log in db_logs:
+                    t = log['created_at'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(log['created_at'], 'strftime') else str(log['created_at'])
+                    log_lines.append(f"{t} - {log['level']} - {log['message']}")
+                st.text_area("数据库日志内容", '\n'.join(log_lines), height=300)
             else:
-                st.info("日志文件为空")
-    except FileNotFoundError:
-        st.info("暂无日志文件（app.log）")
-    except Exception as e:
-        st.error(f"读取日志文件失败: {e}")
-    
+                st.info("暂无数据库日志")
+            db_conn.close()
+    else:
+        st.info("请先连接数据库以查看数据库日志")
+
     st.divider()
     
     st.subheader("向量调试测试")
@@ -3430,66 +3842,78 @@ def run_vector_debug_test():
 def main():
     st.set_page_config(
         page_title="中文地址语义匹配系统",
-        page_icon="🏠",
+        page_icon="🔍",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
+
     init_session_state()
-    
+    inject_global_styles()
+
     with st.sidebar:
-        st.markdown("""
-        <div style='text-align: center; padding: 10px 0;'>
-            <h2 style='color: #1e40af; margin: 0;'>🏠 地址匹配系统</h2>
-            <p style='color: #64748b; font-size: 12px; margin: 5px 0 0 0;'>Chinese Address Semantic Matching</p>
+        st.markdown(f"""
+        <div class="sidebar-title">
+            <h2 style="color: {Colors.PRIMARY}; margin: 0; font-family: {Typography.FONT_FAMILY};">地址匹配系统</h2>
+            <p style="color: {Colors.TEXT_SECONDARY}; font-size: {Typography.SIZE_CAPTION}; margin: 5px 0 0 0;">Chinese Address Semantic Matching</p>
         </div>
         """, unsafe_allow_html=True)
-        
+
         st.divider()
-        
-        menu_options = {
-            "⚙️ 数据库配置": "数据库配置",
-            "📊 向量预处理": "向量预处理",
-            "🔍 地址匹配": "地址匹配",
-            "📋 结果管理": "结果管理",
-            "📝 系统日志": "系统日志"
-        }
-        
-        for display_name, menu_key in menu_options.items():
-            if st.button(display_name, key=menu_key, use_container_width=True):
-                st.session_state.selected_menu = menu_key
-        
+
+        menu_options = [
+            ("数据库配置", "数据库配置"),
+            ("向量预处理", "向量预处理"),
+            ("地址匹配", "地址匹配"),
+            ("结果管理", "结果管理"),
+            ("系统日志", "系统日志"),
+        ]
+
+        def _navigate_to(mk):
+            st.session_state.selected_menu = mk
+
+        for display_name, menu_key in menu_options:
+            is_active = st.session_state.selected_menu == menu_key
+            btn_type = "primary" if is_active else "secondary"
+            st.button(
+                display_name,
+                key=f"nav_{menu_key}",
+                use_container_width=True,
+                type=btn_type,
+                on_click=_navigate_to,
+                args=(menu_key,)
+            )
+
         st.divider()
-        
+
         if st.session_state.get('connected'):
-            st.success("✅ 数据库已连接")
+            st.success("数据库已连接")
         else:
-            st.error("⚠️ 数据库未连接")
-        
+            st.warning("数据库未连接")
+
         st.divider()
-        
+
         gpu_info = st.session_state.get('gpu_info', {})
         if gpu_info.get('cuda_available'):
-            device_label = f"🖥️ GPU: {gpu_info.get('device_name', 'Unknown')}"
+            device_label = f"GPU: {gpu_info.get('device_name', 'Unknown')}"
             st.success(device_label)
         elif gpu_info.get('has_gpu'):
-            st.warning("⚠️ 检测到独立显卡但无法使用GPU")
+            st.warning("检测到独立显卡但无法使用GPU")
             if gpu_info.get('warning'):
                 st.caption(gpu_info['warning'])
         else:
-            st.info("💻 CPU模式运行")
-        
-        st.caption("v1.0 | Powered by MGeo")
-    
-    st.markdown("""
-    <div style='padding: 10px 0 5px 0;'>
-        <h1 style='color: #1e40af; margin: 0; font-size: 28px;'>🏠 中文地址语义匹配系统</h1>
-        <p style='color: #64748b; font-size: 14px; margin: 5px 0 0 0;'>
-            企业地址与标准地址的智能匹配平台 — 向量粗召回 + MGeo精排
-        </p>
+            st.info("CPU 模式运行")
+
+        st.markdown(f"<p class='app-footer'>v1.0 | Powered by MGeo</p>", unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="app-title">
+        中文地址语义匹配系统
     </div>
+    <p style="color: {Colors.TEXT_SECONDARY}; font-size: {Typography.SIZE_BODY}; margin: 5px 0 0 0;">
+        企业地址与标准地址的智能匹配平台 — 向量粗召回 + MGeo精排
+    </p>
     """, unsafe_allow_html=True)
-    
+
     st.divider()
     
     selected_menu = st.session_state.selected_menu

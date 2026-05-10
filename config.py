@@ -184,5 +184,4 @@ class Config:
     MGEO_SIMILARITY_RESULTS_TABLE = 'mgeo_similarity_results'  # MGeo地址相似度匹配结果表
     
     # ==================== 日志配置 ====================
-    LOG_LEVEL = 'INFO'
-    LOG_FILE = 'app.log'
+    LOG_LEVEL = 'WARNING'  # 精简日志，默认只记录 WARNING 及以上

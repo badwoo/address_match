@@ -225,7 +225,7 @@ def test_insert_vectors_chunked_loop():
     insert_end = source.index('def _verify_inserted_vectors')
     insert_source = source[insert_start:insert_end]
 
-    assert 'for chunk_start in range(0, total, insert_chunk_size)' in insert_source, \
+    assert 'range(0, total, insert_chunk_size)' in insert_source, \
         "insert_vectors should iterate over chunks using insert_chunk_size"
     assert 'chunk_end = min(chunk_start + insert_chunk_size, total)' in insert_source, \
         "insert_vectors should calculate chunk_end"
@@ -238,13 +238,54 @@ def test_insert_vectors_commit_per_chunk():
     insert_end = source.index('def _verify_inserted_vectors')
     insert_source = source[insert_start:insert_end]
 
-    chunk_loop_start = insert_source.index('for chunk_start in range(0, total, insert_chunk_size)')
-    chunk_loop_source = insert_source[chunk_loop_start:]
-
-    commit_count = chunk_loop_source.count('self.db.commit()')
-    assert commit_count >= 1, \
-        "insert_vectors should commit at least once per chunk"
+    # 新实现使用 self.db.conn.commit() 配合 autocommit=False 进行批量事务提交
+    assert 'self.db.conn.commit()' in insert_source or 'self.db.commit()' in insert_source, \
+        "insert_vectors should commit within chunk loop"
     print("test_insert_vectors_commit_per_chunk: PASSED")
+
+
+def test_insert_vectors_batched_commits():
+    """验证 insert_vectors 支持批量提交（commit_every_n_chunks 参数）"""
+    source = _read_source('database/vector_store.py')
+    assert 'commit_every_n_chunks' in source, \
+        "insert_vectors should support commit_every_n_chunks parameter for batched commits"
+    print("test_insert_vectors_batched_commits: PASSED")
+
+
+def test_insert_vectors_autocommit_restore():
+    """验证 insert_vectors 在 finally 中恢复 autocommit 状态"""
+    source = _read_source('database/vector_store.py')
+    insert_start = source.index('def insert_vectors')
+    insert_end = source.index('def _verify_inserted_vectors')
+    insert_source = source[insert_start:insert_end]
+
+    assert 'was_autocommit' in insert_source, \
+        "insert_vectors should save original autocommit state"
+    assert 'self.db.conn.autocommit = was_autocommit' in insert_source, \
+        "insert_vectors should restore autocommit in finally block"
+    print("test_insert_vectors_autocommit_restore: PASSED")
+
+
+def test_vector_to_pg_string_method():
+    """验证 _vector_to_pg_string 静态方法使用 numpy vectorized 操作"""
+    source = _read_source('database/vector_store.py')
+    assert 'def _vector_to_pg_string' in source, \
+        "VectorStore should have _vector_to_pg_string static method"
+    assert 'np.array2string' in source, \
+        "_vector_to_pg_string should use np.array2string for vectorized conversion"
+    print("test_vector_to_pg_string_method: PASSED")
+
+
+def test_autovacuum_methods():
+    """验证新增的 autovacuum 管理方法"""
+    source = _read_source('database/vector_store.py')
+    assert 'def disable_autovacuum' in source, \
+        "VectorStore should have disable_autovacuum method"
+    assert 'def enable_autovacuum' in source, \
+        "VectorStore should have enable_autovacuum method"
+    assert 'def vacuum_table' in source, \
+        "VectorStore should have vacuum_table method"
+    print("test_autovacuum_methods: PASSED")
 
 
 def test_insert_vectors_preserves_enterprise_and_standard_types():
@@ -284,6 +325,10 @@ if __name__ == '__main__':
     test_insert_vectors_uses_template_with_vector_cast()
     test_insert_vectors_chunked_loop()
     test_insert_vectors_commit_per_chunk()
+    test_insert_vectors_batched_commits()
+    test_insert_vectors_autocommit_restore()
+    test_vector_to_pg_string_method()
+    test_autovacuum_methods()
     test_insert_vectors_preserves_enterprise_and_standard_types()
 
     print('\n===== ALL TESTS PASSED =====')

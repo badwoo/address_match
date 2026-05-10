@@ -395,12 +395,6 @@ class AddressMatcher:
                     'progress': progress
                 })
         
-        # 创建向量索引
-        self.vector_store.create_vector_index(
-            Config.ENTERPRISE_VECTOR_TABLE, 
-            'idx_enterprise_vector'
-        )
-        
         logger.info(f"Enterprise vectors built. Total: {processed_count}")
         return processed_count
     
@@ -454,12 +448,6 @@ class AddressMatcher:
                     'progress': progress
                 })
         
-        # 创建向量索引
-        self.vector_store.create_vector_index(
-            Config.STANDARD_VECTOR_TABLE, 
-            'idx_standard_vector'
-        )
-        
         logger.info(f"Standard address vectors built. Total: {processed_count}")
         return processed_count
     
@@ -510,22 +498,26 @@ class AddressMatcher:
         )
         self.matching_thread.start()
     
-    def start_recall_async(self, enterprise_table, standard_table, top_n=50, 
-                          progress_callback=None, completed_callback=None):
+    def start_recall_async(self, enterprise_table, standard_table, top_n=50,
+                          progress_callback=None, completed_callback=None,
+                          recall_table=None):
         """
         异步启动粗召回任务（分步执行模式）
-        
+
         Args:
             enterprise_table: 企业向量表名
             standard_table: 标准地址向量表名
             top_n: 召回数量
             progress_callback: 进度回调函数
             completed_callback: 完成回调函数
+            recall_table: 召回结果表名（可选，支持标签特定表）
         """
         if self.matching_thread and self.matching_thread.is_alive():
             logger.warning("Matching thread is already running")
             return
-        
+
+        recall_table = recall_table or Config.RECALL_RESULTS_TABLE
+
         def recall_task():
             """粗召回任务"""
             try:
@@ -533,13 +525,13 @@ class AddressMatcher:
                 self.is_paused = False
                 self.current_stage = '数据粗召回'
                 self.status_message = '正在执行粗召回...'
-                
+
                 stage1_start = time.time()
-                
+
                 # 确保召回表存在并清空
-                self.data_loader.create_recall_table()
-                self.data_loader.truncate_recall_table()
-                
+                self.data_loader.create_recall_table(recall_table)
+                self.data_loader.truncate_recall_table(recall_table)
+
                 # 执行批量召回
                 logger.info(f"Starting batch recall: {enterprise_table} -> {standard_table}")
                 recall_results = self.vector_store.batch_recall(
@@ -548,24 +540,20 @@ class AddressMatcher:
                     top_n=top_n,
                     similarity_threshold=self.threshold
                 )
-                
+
                 recall_count = len(recall_results)
                 candidate_count = sum(len(item['candidates']) for item in recall_results)
-                
-                logger.info(f"[粗召回] 共召回 {recall_count} 家企业，候选地址 {candidate_count} 条")
-                
+
                 # 保存召回结果到数据库
-                logger.info("[粗召回] 开始写入recall_results表...")
-                inserted = self.data_loader.insert_recall_results(recall_results)
-                logger.info(f"[粗召回] 数据写入成功！共插入 {inserted} 条记录到recall_results表")
-                
+                inserted = self.data_loader.insert_recall_results(recall_results, recall_table)
+
                 stage1_time = time.time() - stage1_start
-                
+
                 # 更新进度
                 self.progress = 1.0
                 self.processed_count = recall_count
                 self.speed = recall_count / stage1_time if stage1_time > 0 else 0
-                
+
                 if progress_callback:
                     progress_callback({
                         'stage': '数据粗召回完成',
@@ -575,40 +563,46 @@ class AddressMatcher:
                         'speed': self.speed,
                         'remaining_time': 0
                     })
-                
+
                 logger.info(f"Recall completed: {candidate_count} candidates for {recall_count} enterprises")
-                
+
                 # 设置明确的完成状态
                 self.current_stage = '数据粗召回完成'
                 self.status_message = '粗召回完成'
-                
+
                 # 调用完成回调
                 if completed_callback:
                     completed_callback(recall_results)
-                
+
             except Exception as e:
                 logger.error(f"Recall failed: {str(e)}")
                 self.error_message = str(e)
                 raise
             finally:
                 self.is_running = False
-        
+
         # 启动后台线程
         self.matching_thread = threading.Thread(target=recall_task, daemon=True)
         self.matching_thread.start()
     
-    def start_ranking_async(self, progress_callback=None, completed_callback=None):
+    def start_ranking_async(self, progress_callback=None, completed_callback=None,
+                           recall_table=None, result_table=None):
         """
         异步启动MGeo精排任务（基于recall_results表）
-        
+
         Args:
             progress_callback: 进度回调函数
             completed_callback: 完成回调函数
+            recall_table: 召回结果表名（可选，支持标签特定表）
+            result_table: 匹配结果表名（可选，支持标签特定表）
         """
         if self.matching_thread and self.matching_thread.is_alive():
             logger.warning("Matching thread is already running")
             return
-        
+
+        recall_table = recall_table or Config.RECALL_RESULTS_TABLE
+        result_table = result_table or Config.RESULT_TABLE
+
         def ranking_task():
             """精排任务"""
             try:
@@ -616,56 +610,52 @@ class AddressMatcher:
                 self.is_paused = False
                 self.current_stage = 'MGeo精确匹配'
                 self.status_message = '正在执行MGeo精排...'
-                
+
                 start_time = time.time()
-                
+
                 # 从recall_results表加载召回结果
-                recall_results = self.data_loader.load_recall_results()
+                recall_results = self.data_loader.load_recall_results(recall_table)
                 total = len(recall_results)
                 self.total_count = total
-                
+
                 if total == 0:
                     logger.warning("No recall results found")
                     if completed_callback:
                         completed_callback(0)
                     return
-                
-                logger.info(f"Starting MGeo ranking for {total} enterprises")
-                
+
                 # 确保结果表存在并清空
-                self.data_loader.create_result_table()
-                self.data_loader.truncate_result_table()
-                
+                self.data_loader.create_result_table(result_table)
+                self.data_loader.truncate_result_table(result_table)
+
                 # 使用优化的批量精排方法（一次性批量预测所有候选）
-                logger.info(f"Using optimized batch ranking for {total} enterprises, threshold={self.threshold}")
                 final_results = self.ranking_engine.batch_rank_optimized(recall_results, similarity_threshold=self.threshold)
                 match_count = len(final_results)
-                
+
                 # 批量写入数据库（每1000条）
                 for i in range(0, len(final_results), 1000):
                     batch = final_results[i:i+1000]
-                    inserted = self.data_loader.insert_match_results(batch)
-                    logger.info(f"Inserted {inserted} match results")
-                
+                    inserted = self.data_loader.insert_match_results(batch, result_table)
+
                 total_time = time.time() - start_time
-                
+
                 logger.info(f"MGeo ranking completed. Total time: {total_time:.2f}s, Matches: {match_count}")
-                
+
                 # 调用完成回调
                 if completed_callback:
                     completed_callback(match_count)
-                
+
                 self.status_message = 'MGeo精确匹配完成'
                 self.progress = 1.0
                 self.processed_count = match_count
-                
+
             except Exception as e:
                 logger.error(f"Ranking failed: {str(e)}")
                 self.error_message = str(e)
                 raise
             finally:
                 self.is_running = False
-        
+
         # 启动后台线程
         self.matching_thread = threading.Thread(target=ranking_task, daemon=True)
         self.matching_thread.start()

@@ -95,6 +95,7 @@ class DBConnection:
                 user=self.user,
                 password=self.password
             )
+            self.conn.autocommit = True
             # 使用 RealDictCursor 返回字典形式的查询结果
             self.cursor = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             
@@ -224,6 +225,42 @@ class DBConnection:
             return [row['table_name'] for row in cursor.fetchall()]
         return []
     
+    def table_exists(self, table_name):
+        """
+        检查表是否存在
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            bool: 存在返回 True
+        """
+        sql = """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+        """
+        cursor = self.execute(sql, (self.schema, table_name))
+        if cursor:
+            return cursor.fetchone() is not None
+        return False
+
+    def drop_table(self, table_name):
+        """
+        删除表
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            bool: 删除成功返回 True
+        """
+        sql = f"DROP TABLE IF EXISTS {quote_identifier(table_name)}"
+        cursor = self.execute(sql)
+        if cursor:
+            self.commit()
+            return True
+        return False
+
     def get_columns(self, table_name):
         """
         获取指定表的字段信息

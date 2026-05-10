@@ -201,8 +201,19 @@ streamlit run app.py
 | match_status | VARCHAR(20) | 匹配状态（精确匹配/部分匹配/不匹配） |
 | created_at | TIMESTAMP | 创建时间 |
 
+### match_tags（标签配置表）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | SERIAL | 主键 |
+| tag_name | VARCHAR(255) | 标签显示名 |
+| prefix | VARCHAR(100) | 表名前缀（唯一） |
+| recall_table | VARCHAR(255) | 关联召回结果表名 |
+| match_table | VARCHAR(255) | 关联匹配结果表名 |
+| created_at | TIMESTAMP | 创建时间 |
+
 > **注意**: 以上表名为默认名称，实际表名由 `Config` 类中的配置决定。
 > `DataLoader` 的方法支持 `table_name` 参数覆盖默认表名。
+> 标签功能会为每个标签创建独立的 `{prefix}_recall_results` 和 `{prefix}_match_results` 表。
 
 ## 五、精排匹配逻辑说明
 
@@ -274,3 +285,9 @@ MGeo精排模型输出三个概率值：exact_match（精确匹配）、partial_
 - 系统启动时会自动检测并迁移旧表，添加 `correction_source` 字段
 - 无需手动执行 ALTER TABLE，系统自动处理
 - 旧数据默认 `correction_source='自动匹配'`
+
+### Q10: 标签功能如何使用
+- 在【地址匹配】页面先选择或创建标签
+- 标签用于隔离不同批次的匹配数据，每个标签有独立的召回表和匹配表
+- 删除标签时会同时删除关联的数据表
+- 在【结果管理】页面可按标签筛选查看对应数据

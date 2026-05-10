@@ -3,15 +3,15 @@
 ==================================
 
 功能：
-    1. 生成100组企业地址与标准地址的测试数据（语义不同但预期完全匹配）
-    2. 生成1000条干扰标准地址数据（用于混淆，验证系统匹配能力）
+    1. 生成1000组企业地址与标准地址的测试数据（语义不同但预期完全匹配）
+    2. 生成9000条干扰标准地址数据（用于混淆，验证系统匹配能力）
     3. 所有地址数据均无重复
     4. 将数据写入enterprise表和standard_address表
 
 数据结构：
-    - enterprise表：100条企业地址（ID: EVAL_E0001~EVAL_E0100）
-    - standard_address表：100条目标标准地址（addr_code: EVAL_A0001~EVAL_A0100）
-                          + 1000条干扰标准地址（addr_code: EVAL_D0001~EVAL_D1000）
+    - enterprise表：1000条企业地址（ID: EVAL_E0001~EVAL_E1000）
+    - standard_address表：1000条目标标准地址（addr_code: EVAL_A0001~EVAL_A1000）
+                          + 9000条干扰标准地址（addr_code: EVAL_D0001~EVAL_D9000）
 """
 
 import psycopg2
@@ -175,12 +175,12 @@ def apply_transform(road, number, district, transform_type):
     return None
 
 
-def generate_100_match_pairs():
+def generate_1000_match_pairs():
     """
-    生成100组语义不同但预期完全匹配的深圳地址数据
+    生成1000组语义不同但预期完全匹配的深圳地址数据
 
     Returns:
-        list: 100组匹配数据
+        list: 1000组匹配数据
     """
     results = []
     used_enterprise = set()
@@ -190,61 +190,66 @@ def generate_100_match_pairs():
     district_names = list(DISTRICTS.keys())
     pair_idx = 0
 
-    for di, district in enumerate(district_names):
-        roads = DISTRICTS[district]["roads"]
-        for ri, road in enumerate(roads):
-            if pair_idx >= 100:
-                break
+    while pair_idx < 1000:
+        for di, district in enumerate(district_names):
+            roads = DISTRICTS[district]["roads"]
+            for ri, road in enumerate(roads):
+                if pair_idx >= 1000:
+                    break
 
-            number = (pair_idx + 1) * 37 + 100
-            road_number_key = f"{district}{road}{number}"
-            if road_number_key in used_roads_numbers:
-                continue
-            used_roads_numbers.add(road_number_key)
+                number = (pair_idx + 1) * 37 + 100
+                road_number_key = f"{district}{road}{number}"
+                if road_number_key in used_roads_numbers:
+                    number = (pair_idx + 1) * 53 + 200
+                    road_number_key = f"{district}{road}{number}"
+                    if road_number_key in used_roads_numbers:
+                        continue
 
-            transform_type = pair_idx % 20
+                used_roads_numbers.add(road_number_key)
 
-            ent_addr, std_addr, diff_desc = apply_transform(road, number, district, transform_type)
+                transform_type = pair_idx % 20
 
-            if ent_addr in used_enterprise or std_addr in used_standard:
-                number = (pair_idx + 1) * 53 + 200
                 ent_addr, std_addr, diff_desc = apply_transform(road, number, district, transform_type)
+
                 if ent_addr in used_enterprise or std_addr in used_standard:
-                    continue
+                    number = (pair_idx + 1) * 73 + 300
+                    ent_addr, std_addr, diff_desc = apply_transform(road, number, district, transform_type)
+                    if ent_addr in used_enterprise or std_addr in used_standard:
+                        continue
 
-            used_enterprise.add(ent_addr)
-            used_standard.add(std_addr)
+                used_enterprise.add(ent_addr)
+                used_standard.add(std_addr)
 
-            pair_idx += 1
-            results.append({
-                'group_id': pair_idx,
-                'enterprise_id': f"EVAL_E{pair_idx:04d}",
-                'enterprise_name': f"深圳测评企业{pair_idx:04d}",
-                'enterprise_address': ent_addr,
-                'standard_addr_code': f"EVAL_A{pair_idx:04d}",
-                'standard_address': std_addr,
-                'house_code': f"HC{pair_idx:08d}",
-                'consistency_type': '部分一致' if ent_addr != std_addr else '完全一致',
-                'expected_match': '完全匹配',
-                'semantic_diff': diff_desc,
-                'transform_type': transform_type,
-            })
+                pair_idx += 1
+                results.append({
+                    'group_id': pair_idx,
+                    'enterprise_id': f"EVAL_E{pair_idx:04d}",
+                    'enterprise_name': f"深圳测评企业{pair_idx:04d}",
+                    'enterprise_address': ent_addr,
+                    'standard_addr_code': f"EVAL_A{pair_idx:04d}",
+                    'standard_address': std_addr,
+                    'house_code': f"HC{pair_idx:08d}",
+                    'consistency_type': '部分一致' if ent_addr != std_addr else '完全一致',
+                    'expected_match': '完全匹配',
+                    'semantic_diff': diff_desc,
+                    'transform_type': transform_type,
+                })
 
-        if pair_idx >= 100:
-            break
+            if pair_idx >= 1000:
+                break
 
     return results
 
 
-def generate_1000_interference_addresses(match_pairs):
+def generate_9000_interference_addresses(match_pairs):
     """
-    生成1000条干扰标准地址数据
+    生成9000条干扰标准地址数据
 
     Args:
-        match_pairs: 100组匹配数据，用于避免重复
+        match_pairs: 1000组匹配数据，用于避免重复
 
     Returns:
-        list: 1000条干扰数据
+        list: 9000条干扰数据
     """
     existing_addrs = set()
     for p in match_pairs:
@@ -256,7 +261,7 @@ def generate_1000_interference_addresses(match_pairs):
 
     idx = 0
     attempts = 0
-    while idx < 1000 and attempts < 50000:
+    while idx < 9000 and attempts < 500000:
         attempts += 1
         district = district_names[idx % len(district_names)]
         roads = DISTRICTS[district]["roads"]
@@ -336,8 +341,8 @@ def insert_to_database(match_pairs, interference_addrs):
     将数据插入数据库
 
     Args:
-        match_pairs: 100组匹配数据
-        interference_addrs: 1000条干扰数据
+        match_pairs: 1000组匹配数据
+        interference_addrs: 9000条干扰数据
 
     Returns:
         tuple: (enterprise插入数, standard_address插入数)
@@ -353,25 +358,48 @@ def insert_to_database(match_pairs, interference_addrs):
     cur = conn.cursor()
 
     try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS enterprise (
+                id SERIAL PRIMARY KEY,
+                source_id VARCHAR(255) NOT NULL,
+                enterprise_name TEXT,
+                address TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS standard_address (
+                id SERIAL PRIMARY KEY,
+                source_id VARCHAR(255) NOT NULL,
+                address TEXT NOT NULL,
+                room_no VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cur.execute("DELETE FROM enterprise WHERE source_id LIKE 'EVAL_%'")
+        cur.execute("DELETE FROM standard_address WHERE source_id LIKE 'EVAL_%'")
+
         e_count = 0
         s_count = 0
 
         for item in match_pairs:
             cur.execute(
-                "INSERT INTO enterprise (id, name, address) VALUES (%s, %s, %s)",
+                "INSERT INTO enterprise (source_id, enterprise_name, address) VALUES (%s, %s, %s)",
                 (item['enterprise_id'], item['enterprise_name'], item['enterprise_address'])
             )
             e_count += 1
 
             cur.execute(
-                "INSERT INTO standard_address (addr_code, standard_addr, house_code) VALUES (%s, %s, %s)",
+                "INSERT INTO standard_address (source_id, address, room_no) VALUES (%s, %s, %s)",
                 (item['standard_addr_code'], item['standard_address'], item['house_code'])
             )
             s_count += 1
 
         for item in interference_addrs:
             cur.execute(
-                "INSERT INTO standard_address (addr_code, standard_addr, house_code) VALUES (%s, %s, %s)",
+                "INSERT INTO standard_address (source_id, address, room_no) VALUES (%s, %s, %s)",
                 (item['addr_code'], item['standard_address'], item['house_code'])
             )
             s_count += 1
@@ -406,22 +434,22 @@ def verify_data():
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT COUNT(*) FROM enterprise WHERE id LIKE 'EVAL_E%'")
+        cur.execute("SELECT COUNT(*) FROM enterprise WHERE source_id LIKE 'EVAL_E%'")
         e_count = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM standard_address WHERE addr_code LIKE 'EVAL_A%'")
+        cur.execute("SELECT COUNT(*) FROM standard_address WHERE source_id LIKE 'EVAL_A%'")
         a_count = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM standard_address WHERE addr_code LIKE 'EVAL_D%'")
+        cur.execute("SELECT COUNT(*) FROM standard_address WHERE source_id LIKE 'EVAL_D%'")
         d_count = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM standard_address WHERE addr_code LIKE 'EVAL_%'")
+        cur.execute("SELECT COUNT(*) FROM standard_address WHERE source_id LIKE 'EVAL_%'")
         s_total = cur.fetchone()[0]
 
-        cur.execute("SELECT address FROM enterprise WHERE id LIKE 'EVAL_E%'")
+        cur.execute("SELECT address FROM enterprise WHERE source_id LIKE 'EVAL_E%'")
         e_addrs = [r[0] for r in cur.fetchall()]
 
-        cur.execute("SELECT standard_addr FROM standard_address WHERE addr_code LIKE 'EVAL_%'")
+        cur.execute("SELECT address FROM standard_address WHERE source_id LIKE 'EVAL_%'")
         s_addrs = [r[0] for r in cur.fetchall()]
 
         e_dup = len(e_addrs) - len(set(e_addrs))
@@ -435,17 +463,17 @@ def verify_data():
         print(f"  enterprise地址重复数: {e_dup}")
         print(f"  standard_address地址重复数: {s_dup}")
 
-        cur.execute("SELECT id, name, address FROM enterprise WHERE id LIKE 'EVAL_E%' ORDER BY id LIMIT 3")
+        cur.execute("SELECT source_id, enterprise_name, address FROM enterprise WHERE source_id LIKE 'EVAL_E%' ORDER BY source_id LIMIT 3")
         print(f"\n  enterprise样本:")
         for row in cur.fetchall():
             print(f"    {row}")
 
-        cur.execute("SELECT addr_code, standard_addr, house_code FROM standard_address WHERE addr_code LIKE 'EVAL_A%' ORDER BY addr_code LIMIT 3")
+        cur.execute("SELECT source_id, address, room_no FROM standard_address WHERE source_id LIKE 'EVAL_A%' ORDER BY source_id LIMIT 3")
         print(f"\n  standard_address目标样本:")
         for row in cur.fetchall():
             print(f"    {row}")
 
-        cur.execute("SELECT addr_code, standard_addr, house_code FROM standard_address WHERE addr_code LIKE 'EVAL_D%' ORDER BY addr_code LIMIT 3")
+        cur.execute("SELECT source_id, address, room_no FROM standard_address WHERE source_id LIKE 'EVAL_D%' ORDER BY source_id LIMIT 3")
         print(f"\n  standard_address干扰样本:")
         for row in cur.fetchall():
             print(f"    {row}")
@@ -458,7 +486,7 @@ def verify_data():
 
 
 if __name__ == '__main__':
-    match_pairs = generate_100_match_pairs()
+    match_pairs = generate_1000_match_pairs()
     print(f"生成匹配数据: {len(match_pairs)} 组")
 
     e_set = set(p['enterprise_address'] for p in match_pairs)
@@ -466,7 +494,7 @@ if __name__ == '__main__':
     print(f"企业地址唯一: {len(e_set)}/{len(match_pairs)}")
     print(f"标准地址唯一: {len(s_set)}/{len(match_pairs)}")
 
-    interference_addrs = generate_1000_interference_addresses(match_pairs)
+    interference_addrs = generate_9000_interference_addresses(match_pairs)
     print(f"生成干扰数据: {len(interference_addrs)} 条")
 
     i_set = set(a['standard_address'] for a in interference_addrs)

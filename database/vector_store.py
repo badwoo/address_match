@@ -134,137 +134,269 @@ class VectorStore:
             return True
         return False
     
-    def create_vector_index(self, table_name=None, index_name=None):
+    def check_index_exists(self, table_name, index_name):
         """
-        创建向量索引（ivfflat）
-        
-        使用 ivfflat 索引加速向量相似性搜索，适合大规模数据。
-        
+        检查索引是否已存在
+
+        Args:
+            table_name: 表名
+            index_name: 索引名
+
+        Returns:
+            bool: 存在返回 True
+        """
+        check_sql = """
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = %s
+            AND tablename = %s
+            AND indexname = %s
+        """
+        cursor = self.db.execute(check_sql, (self.db.schema, table_name, index_name))
+        if cursor and cursor.fetchone():
+            return True
+        return False
+
+    def drop_vector_index(self, index_name):
+        """
+        删除向量索引
+
+        Args:
+            index_name: 索引名
+
+        Returns:
+            bool: 删除成功返回 True
+        """
+        sql = f"DROP INDEX IF EXISTS {index_name}"
+        cursor = self.db.execute(sql)
+        if cursor:
+            self.db.commit()
+            logger.info(f"Vector index {index_name} dropped successfully")
+            return True
+        return False
+
+    def create_vector_index(self, table_name=None, index_name=None,
+                            index_type='ivfflat', lists=None, m=None,
+                            ef_construction=None, maintenance_work_mem=None):
+        """
+        创建向量索引（支持 ivfflat 和 hnsw 两种类型）
+
         Args:
             table_name: 表名，默认使用 Config.VECTOR_TABLE
             index_name: 索引名，默认使用 Config.INDEX_NAME
-        
+            index_type: 索引类型，'ivfflat' 或 'hnsw'
+            lists: ivfflat 的 lists 参数，None 时自动计算
+            m: hnsw 的 m 参数，None 时默认 16
+            ef_construction: hnsw 的 ef_construction 参数，None 时默认 200
+            maintenance_work_mem: 维护操作内存，如 '1GB'，None 时不修改
+
         Returns:
             bool: 创建成功返回 True
         """
         table_name = table_name or self.table_name
         index_name = index_name or self.index_name
-        
-        # 检查索引是否已存在
-        check_sql = f"""
-            SELECT 1 FROM pg_indexes 
-            WHERE schemaname = %s 
-            AND tablename = %s 
-            AND indexname = %s
-        """
-        cursor = self.db.execute(check_sql, (self.db.schema, table_name, index_name))
-        if cursor and cursor.fetchone():
+
+        if self.check_index_exists(table_name, index_name):
             logger.info(f"Index {index_name} already exists, skipping creation")
             return True
-        
-        # 创建 ivfflat 索引，使用余弦距离
-        sql = f"""
-            CREATE INDEX {index_name} 
-            ON {table_name} 
-            USING ivfflat (vector vector_cosine_ops) 
-            WITH (lists = 1000)
-        """
-        cursor = self.db.execute(sql)
-        if cursor:
-            self.db.commit()
-            logger.info(f"Vector index {index_name} created successfully")
-            return True
-        return False
+
+        # 获取向量表数据量用于自动计算参数
+        row_count = self.get_vector_count(table_name)
+
+        # 自动计算 ivfflat lists 参数
+        if index_type == 'ivfflat' and lists is None:
+            if row_count <= 1_000_000:
+                lists = max(100, min(4000, row_count // 1000))
+            else:
+                lists = max(100, min(4000, int(row_count ** 0.5)))
+            logger.info(f"Auto-calculated ivfflat lists={lists} for {row_count} rows")
+
+        # 自动计算 hnsw 参数
+        if index_type == 'hnsw':
+            if m is None:
+                m = 16
+            if ef_construction is None:
+                ef_construction = 200
+            logger.info(f"Using hnsw parameters: m={m}, ef_construction={ef_construction}")
+
+        # 设置 maintenance_work_mem
+        original_work_mem = None
+        if maintenance_work_mem:
+            try:
+                cursor = self.db.execute("SHOW maintenance_work_mem")
+                if cursor:
+                    row = cursor.fetchone()
+                    original_work_mem = row[0] if row else None
+                self.db.execute(f"SET maintenance_work_mem = '{maintenance_work_mem}'")
+                logger.info(f"Set maintenance_work_mem to {maintenance_work_mem} (original: {original_work_mem})")
+            except Exception as e:
+                logger.warning(f"Failed to set maintenance_work_mem: {e}")
+
+        try:
+            # 构建创建索引 SQL
+            if index_type == 'ivfflat':
+                sql = f"""
+                    CREATE INDEX {index_name}
+                    ON {table_name}
+                    USING ivfflat (vector vector_cosine_ops)
+                    WITH (lists = {lists})
+                """
+            elif index_type == 'hnsw':
+                sql = f"""
+                    CREATE INDEX {index_name}
+                    ON {table_name}
+                    USING hnsw (vector vector_cosine_ops)
+                    WITH (m = {m}, ef_construction = {ef_construction})
+                """
+            else:
+                logger.error(f"Unsupported index type: {index_type}")
+                return False
+
+            cursor = self.db.execute(sql)
+            if cursor:
+                self.db.commit()
+                logger.info(f"Vector index {index_name} ({index_type}) created successfully on {table_name}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to create vector index {index_name}: {e}")
+            self.db.rollback()
+            return False
+        finally:
+            # 恢复 maintenance_work_mem 为原始值
+            if original_work_mem:
+                try:
+                    self.db.execute(f"SET maintenance_work_mem = '{original_work_mem}'")
+                    logger.info(f"Restored maintenance_work_mem to {original_work_mem}")
+                except Exception as e:
+                    logger.warning(f"Failed to restore maintenance_work_mem: {e}")
     
-    def insert_vectors(self, vectors, source_ids, addresses, table_name=None, extra_data=None, table_type='enterprise', insert_chunk_size=5000):
+    @staticmethod
+    def _vector_to_pg_string(vec):
         """
-        批量插入向量数据（使用 execute_values 高效批量插入）
-        
-        分块构建向量字符串并批量插入，避免一次性将所有向量的字符串表示加载到内存。
-        
+        将 numpy 向量转为 pgvector 兼容的字符串格式。
+        使用 numpy 的 C 级别 vectorized 操作，比逐元素 repr() 快 10-20x。
+
+        Args:
+            vec: numpy 数组，形状为 (dim,) 或 (1, dim)
+
+        Returns:
+            str: 如 '[0.12345678,-0.87654321,...]'
+        """
+        arr = np.asarray(vec, dtype=np.float32).ravel()
+        return np.array2string(arr, separator=',', max_line_width=np.inf,
+                               threshold=np.inf, floatmode='fixed',
+                               formatter={'float_kind': lambda x: f'{x:.8f}'})
+
+    def insert_vectors(self, vectors, source_ids, addresses, table_name=None,
+                       extra_data=None, table_type='enterprise',
+                       insert_chunk_size=5000, commit_every_n_chunks=10):
+        """
+        批量插入向量数据（高性能版）。
+
+        优化点：
+        - 使用 numpy vectorized 操作构建向量字符串（无 Python 逐元素循环）
+        - 临时关闭 autocommit，批量事务提交（默认每 10 chunk/5万条 commit 一次）
+        - finally 块确保 autocommit 一定恢复
+
         Args:
             vectors: 向量数组，形状为 (n, dim)
             source_ids: 源数据ID列表
             addresses: 地址文本列表
             table_name: 目标表名
-            extra_data: 额外数据列表（企业表为企业名，标准地址表为房号）
-            table_type: 表类型，'enterprise' 或 'standard'，决定插入的字段结构
-            insert_chunk_size: 每次插入的向量数量，控制内存占用
-        
+            extra_data: 额外数据列表
+            table_type: 表类型，'enterprise' 或 'standard'
+            insert_chunk_size: 每次 execute_values 的向量数量
+            commit_every_n_chunks: 每 N 个 chunk 提交一次事务
+
         Returns:
             int: 成功插入的记录数
         """
         table_name = table_name or self.table_name
         if len(vectors) == 0:
             return 0
-        
+
         actual_dim = vectors.shape[1] if len(vectors.shape) > 1 else len(vectors[0])
         total = len(vectors)
         logger.debug(f"Inserting {total} vectors with dimension {actual_dim} into {table_name}")
-        
+
+        first_vector = vectors[0] if isinstance(vectors[0], np.ndarray) else np.array(vectors[0])
+        first_norm = np.linalg.norm(first_vector)
+        logger.info(f"待插入向量样本 - 维度: {len(first_vector)}, L2范数: {first_norm:.8f}")
+
+        if abs(first_norm - 1.0) > 0.1:
+            logger.warning(f"向量可能未正确归一化，范数={first_norm:.8f}")
+
+        if table_type == 'enterprise':
+            sql = f"""
+                INSERT INTO {table_name} (source_id, enterprise_name, address, vector)
+                VALUES %s
+            """
+            template = f"(%s, %s, %s, %s::vector({actual_dim}))"
+        else:
+            sql = f"""
+                INSERT INTO {table_name} (source_id, address, room_no, vector)
+                VALUES %s
+            """
+            template = f"(%s, %s, %s, %s::vector({actual_dim}))"
+
+        # ---- 事务控制：临时关闭 autocommit 进行批量提交 ----
+        was_autocommit = self.db.conn.autocommit
+        self.db.conn.autocommit = False
+        inserted_count = 0
+        total_chunks = (total + insert_chunk_size - 1) // insert_chunk_size
+
         try:
-            first_vector = vectors[0] if isinstance(vectors[0], np.ndarray) else np.array(vectors[0])
-            first_norm = np.linalg.norm(first_vector)
-            logger.info(f"待插入向量样本 - 维度: {len(first_vector)}, L2范数: {first_norm:.8f}")
-            
-            if abs(first_norm - 1.0) > 0.1:
-                logger.warning(f"向量可能未正确归一化，范数={first_norm:.8f}")
-            
-            if table_type == 'enterprise':
-                sql = f"""
-                    INSERT INTO {table_name} (source_id, enterprise_name, address, vector)
-                    VALUES %s
-                """
-                template = f"(%s, %s, %s, %s::vector({actual_dim}))"
-            else:
-                sql = f"""
-                    INSERT INTO {table_name} (source_id, address, room_no, vector)
-                    VALUES %s
-                """
-                template = f"(%s, %s, %s, %s::vector({actual_dim}))"
-            
-            inserted_count = 0
-            
-            for chunk_start in range(0, total, insert_chunk_size):
+            for chunk_idx, chunk_start in enumerate(range(0, total, insert_chunk_size)):
                 chunk_end = min(chunk_start + insert_chunk_size, total)
                 values = []
-                
+
                 for i in range(chunk_start, chunk_end):
-                    source_id = source_ids[i]
-                    address = addresses[i]
-                    vector = vectors[i]
-                    
-                    vec_data = vector if isinstance(vector, np.ndarray) else np.array(vector)
-                    vec_data = vec_data.astype(np.float32)
-                    vec_str = '[' + ','.join(repr(float(x)) for x in vec_data.tolist()) + ']'
-                    
+                    vec_str = self._vector_to_pg_string(vectors[i])
+
                     if table_type == 'enterprise':
                         enterprise_name = extra_data[i] if extra_data else ''
-                        values.append((source_id, enterprise_name, address, vec_str))
+                        values.append((source_ids[i], enterprise_name, addresses[i], vec_str))
                     else:
                         room_no = extra_data[i] if extra_data else ''
-                        values.append((source_id, address, room_no, vec_str))
-                
+                        values.append((source_ids[i], addresses[i], room_no, vec_str))
+
                 psycopg2.extras.execute_values(
                     self.db.cursor, sql, values, template=template, page_size=1000
                 )
-                self.db.commit()
                 inserted_count += len(values)
+
+                if (chunk_idx + 1) % commit_every_n_chunks == 0 or chunk_idx == total_chunks - 1:
+                    self.db.conn.commit()
+                    logger.debug(f"Committed after chunk {chunk_idx + 1}/{total_chunks}")
+
                 logger.info(f"已插入 {inserted_count}/{total} 条向量到 {table_name}...")
-            
+
             logger.info(f"✅ 成功插入 {inserted_count} 条向量到 {table_name}")
-            
+
             sample_norm = np.linalg.norm(vectors[0])
             logger.info(f"样本向量L2范数（应≈1.0）：{sample_norm:.8f}")
-            
+
             self._verify_inserted_vectors(table_name, source_ids[:3] if len(source_ids) >= 3 else source_ids)
-            
+
             return inserted_count
         except Exception as e:
             logger.error(f"❌ 插入向量失败：{str(e)}")
-            self.db.rollback()
+            try:
+                self.db.conn.rollback()
+            except Exception:
+                pass
             return 0
-    
+        finally:
+            # 恢复 autocommit 前必须先结束当前事务，否则 psycopg2 报错
+            try:
+                self.db.conn.commit()
+            except Exception:
+                try:
+                    self.db.conn.rollback()
+                except Exception:
+                    pass
+            self.db.conn.autocommit = was_autocommit
+
     def _verify_inserted_vectors(self, table_name, sample_ids):
         """
         验证已插入的向量是否正确归一化
@@ -302,7 +434,7 @@ class VectorStore:
         """
         向量相似性搜索
         
-        使用 pgvector 的L2距离操作符进行近似最近邻搜索。
+        使用 pgvector 的余弦距离操作符进行近似最近邻搜索。
         
         Args:
             query_vector: 查询向量
@@ -316,9 +448,9 @@ class VectorStore:
         query_vector = np.array(query_vector)
         
         sql = f"""
-            SELECT source_id, address, 1 - (vector <-> %s) as similarity
+            SELECT source_id, address, 1 - (vector <=> %s) as similarity
             FROM {table_name}
-            ORDER BY vector <-> %s
+            ORDER BY vector <=> %s
             LIMIT %s
         """
         
@@ -354,7 +486,7 @@ class VectorStore:
         
         threshold_condition = ""
         if similarity_threshold is not None:
-            threshold_condition = f"WHERE 1 - (c.vector <-> a.vector) >= {float(similarity_threshold)}"
+            threshold_condition = f"WHERE 1 - (c.vector <=> a.vector) >= {float(similarity_threshold)}"
         
         sql = f"""
             SELECT 
@@ -364,7 +496,7 @@ class VectorStore:
                 a.source_id AS standard_id,
                 a.address AS standard_address,
                 a.room_no,
-                1 - (c.vector <-> a.vector) AS similarity
+                1 - (c.vector <=> a.vector) AS similarity
             FROM {enterprise_table} c
             JOIN LATERAL (
                 SELECT 
@@ -373,7 +505,7 @@ class VectorStore:
                     room_no,
                     vector
                 FROM {standard_table}
-                ORDER BY c.vector <-> vector
+                ORDER BY c.vector <=> vector
                 LIMIT {top_n}
             ) a ON true
             {threshold_condition}
@@ -509,3 +641,68 @@ class VectorStore:
             if result and result['atttypmod']:
                 return result['atttypmod']
         return None
+
+    def disable_autovacuum(self, table_name):
+        """
+        批量导入前禁用 autovacuum，防止 autovacuum 与批量 INSERT 争抢 I/O。
+
+        Args:
+            table_name: 目标表名
+
+        Returns:
+            bool: 成功返回 True
+        """
+        sql = f"ALTER TABLE {table_name} SET (autovacuum_enabled = false)"
+        cursor = self.db.execute(sql)
+        if cursor:
+            logger.info(f"Autovacuum 已禁用: {table_name}")
+            return True
+        return False
+
+    def enable_autovacuum(self, table_name):
+        """
+        批量导入完成后重新启用 autovacuum。
+
+        Args:
+            table_name: 目标表名
+
+        Returns:
+            bool: 成功返回 True
+        """
+        sql = f"ALTER TABLE {table_name} SET (autovacuum_enabled = true)"
+        cursor = self.db.execute(sql)
+        if cursor:
+            logger.info(f"Autovacuum 已恢复: {table_name}")
+            return True
+        return False
+
+    def vacuum_table(self, table_name, analyze=True):
+        """
+        对表执行 VACUUM（和可选 ANALYZE），回收空间并更新统计信息。
+        VACUUM 不能在事务块内执行，因此临时设置 autocommit=True。
+
+        Args:
+            table_name: 目标表名
+            analyze: 是否同时执行 ANALYZE
+
+        Returns:
+            bool: 成功返回 True
+        """
+        if analyze:
+            sql = f"VACUUM ANALYZE {table_name}"
+        else:
+            sql = f"VACUUM {table_name}"
+
+        was_autocommit = self.db.conn.autocommit
+        self.db.conn.autocommit = True
+        try:
+            cursor = self.db.execute(sql)
+            if cursor:
+                logger.info(f"VACUUM {'ANALYZE ' if analyze else ''}完成: {table_name}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"VACUUM 失败: {table_name}: {e}")
+            return False
+        finally:
+            self.db.conn.autocommit = was_autocommit

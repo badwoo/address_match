@@ -1,0 +1,220 @@
+<mxfile host="app.diagrams.net" modified="2026-05-06T00:00:00.000Z" agent="Mozilla/5.0" version="22.0.0" etag="flowchart" type="device">
+  <diagram name="实施流程图" id="flowchart-main">
+    <mxGraphModel dx="1434" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="1654" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Title -->
+        <mxCell id="title1" value="&lt;b&gt;深圳市市场监管局政务服务基础能力提升项目&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=22;fontColor=#2c3e50;" vertex="1" parent="1">
+          <mxGeometry x="200" y="20" width="769" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="title2" value="实施流程图" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=16;fontColor=#7f8c8d;" vertex="1" parent="1">
+          <mxGeometry x="200" y="60" width="769" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Stage 1 -->
+        <mxCell id="s1" value="第一阶段：数据准备" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a5276;strokeColor=#154360;fontColor=#ffffff;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="150" y="110" width="870" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="s1d" value="市监商事主体数据 (HA_MER_BASE) + 政法委网格数据 + 房屋编码数据 + 互联网接口数据" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d6eaf8;strokeColor=#85c1e9;fontColor=#1a5276;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="180" width="770" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s1" target="s1d">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Stage 2 -->
+        <mxCell id="s2" value="第二阶段：数据调研与规则制定" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2874a6;strokeColor=#1a5276;fontColor=#ffffff;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="150" y="260" width="870" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="s2l" value="字段完整性 / 唯一性&lt;br&gt;/ 规范性调研" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d4e6f1;strokeColor=#85c1e9;fontColor=#1a5276;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="340" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s2r" value="定义分类标签规则&lt;br&gt;(匹配策略/可信度)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d4e6f1;strokeColor=#85c1e9;fontColor=#1a5276;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="620" y="340" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="a2l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s2" target="s2l">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a2r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s2" target="s2r">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Stage 3 -->
+        <mxCell id="s3" value="第三阶段：数据治理实施" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3498db;strokeColor=#2874a6;fontColor=#ffffff;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="150" y="440" width="870" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a3l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s2l" target="s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a3r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s2r" target="s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- 3.1 -->
+        <mxCell id="s31" value="3.1 规则匹配" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#aed6f1;strokeColor=#5dade2;fontColor=#1a5276;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="200" y="530" width="350" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s31d" value="地址分词&lt;br&gt;L1-L5级由粗到细匹配&lt;br&gt;(全地址→省市区街道)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ebf5fb;strokeColor=#85c1e9;fontColor=#1a5276;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="590" width="350" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="a31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s3" target="s31">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a31d" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s31" target="s31d">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- 3.2 -->
+        <mxCell id="s32" value="3.2 MGeo方案匹配" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#aed6f1;strokeColor=#5dade2;fontColor=#1a5276;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="620" y="530" width="350" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s32d" value="阿里MGeo开源模型&lt;br&gt;数据拼召回 + 精排架构&lt;br&gt;地址进一步匹配验证" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ebf5fb;strokeColor=#85c1e9;fontColor=#1a5276;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="620" y="590" width="350" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="a32" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s3" target="s32">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a32d" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s32" target="s32d">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- 3.3 -->
+        <mxCell id="s33" value="3.3 互联网方案" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#85c1e9;strokeColor=#3498db;fontColor=#ffffff;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="700" width="330" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s33l" value="百度/高德接口&lt;br&gt;地址获取+地理编码" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d6eaf8;strokeColor=#5dade2;fontColor=#1a5276;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="300" y="770" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="s33r" value="地址地理四配&lt;br&gt;坐标转换" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d6eaf8;strokeColor=#5dade2;fontColor=#1a5276;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="610" y="770" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a33l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s31d" target="s33">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a33r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s32d" target="s33">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a33ll" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s33" target="s33l">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a33rr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s33" target="s33r">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Stage 4 -->
+        <mxCell id="s4" value="第四阶段：质量检核与人工复核" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#27ae60;strokeColor=#1e8449;fontColor=#ffffff;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="150" y="870" width="870" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="s4l" value="MGeo多轮验证&lt;br&gt;(不同阈值)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5f5e3;strokeColor=#82e0aa;fontColor=#1e8449;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="950" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s4r" value="人工抽样检查&lt;br&gt;质量把关" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5f5e3;strokeColor=#82e0aa;fontColor=#1e8449;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="620" y="950" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="a4l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s33l" target="s4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a4r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s33r" target="s4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a4ll" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s4" target="s4l">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a4rr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s4" target="s4r">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Stage 5 -->
+        <mxCell id="s5" value="第五阶段：效果评估 + 数据分类分级打标签" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e67e22;strokeColor=#ca6f1e;fontColor=#ffffff;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="150" y="1060" width="870" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="a5l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s4l" target="s5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a5r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s4r" target="s5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s51" value="黑牌经济单" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdebd0;strokeColor=#f8c471;fontColor=#b9770e;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="160" y="1140" width="140" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s52" value="灰名单经济单" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdebd0;strokeColor=#f8c471;fontColor=#b9770e;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="320" y="1140" width="140" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s53" value="片区经济单" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdebd0;strokeColor=#f8c471;fontColor=#b9770e;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="480" y="1140" width="140" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s54" value="绿通数据清单" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdebd0;strokeColor=#f8c471;fontColor=#b9770e;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="640" y="1140" width="140" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s55" value="灭失数据清单" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdebd0;strokeColor=#f8c471;fontColor=#b9770e;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="240" y="1210" width="140" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s56" value="深汕数据清单" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdebd0;strokeColor=#f8c471;fontColor=#b9770e;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="560" y="1210" width="140" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="a51" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s5" target="s51">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a52" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s5" target="s52">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a53" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s5" target="s53">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a54" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s5" target="s54">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a55l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s51" target="s55">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a55r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s52" target="s55">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a56l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s53" target="s56">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a56r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s54" target="s56">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Stage 6 -->
+        <mxCell id="s6" value="第六阶段：数据入库" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#8e44ad;strokeColor=#7d3c98;fontColor=#ffffff;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="150" y="1310" width="870" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="s6l" value="标签化数据整理&lt;br&gt;关联房屋编码" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8daef;strokeColor=#c39bd3;fontColor=#7d3c98;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="1390" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s6r" value="数据融合&lt;br&gt;汇总生成成果表" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8daef;strokeColor=#c39bd3;fontColor=#7d3c98;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="620" y="1390" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="a6l" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s55" target="s6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a6r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s56" target="s6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a6ll" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s6" target="s6l">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a6rr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s6" target="s6r">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- End -->
+        <mxCell id="end" value="项目完成" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2c3e50;strokeColor=#1a252f;fontColor=#ffffff;fontSize=18;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="1500" width="330" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="aend1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s6l" target="end">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aend2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#95a5a6;strokeWidth=2;" edge="1" parent="1" source="s6r" target="end">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
