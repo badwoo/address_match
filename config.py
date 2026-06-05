@@ -11,10 +11,11 @@
     阶段2（精排）：使用 MGeo 地址相似度匹配模型进行精准排序
 
 MGeo精排模型输出：
-    模型输出三个概率值：exact_match（精确匹配）、not_match（不匹配）、partial_match（部分匹配）
+    模型输出三个概率值：exact_match（精确匹配）、partial_match（部分匹配）、not_match（不匹配）
     候选排序逻辑：
-        主排序标准：exact_match - 按精确匹配概率最高值筛选最佳匹配候选
-        次排序标准：not_match - 当 exact_match 相同时，优先选择不匹配概率更低的候选
+        主排序标准：exact_match 最高值，四舍五入保留两位小数后筛选最佳匹配候选
+        次排序标准：partial_match 最高值，当 exact_match 相同时比较
+        第三排序标准：not_match 最低值，当 exact_match 和 partial_match 都相同时比较
     匹配状态判断：取三个概率中最大值决定匹配状态
         - exact_match 最大 → 精确匹配
         - partial_match 最大 → 部分匹配
@@ -106,8 +107,8 @@ def _find_model_local_path(model_name):
 
     按优先级依次搜索以下位置：
         1. 项目目录下的 models/ 文件夹
-        2. 用户主目录下的 .cache/modelscope/hub/models/ 文件夹
-        3. 环变量 MODELSCOPE_CACHE 指定的缓存目录
+        2. 用户主目录下的 .cache/modelscope/hub/models/ 文件夹（含 MODELSCOPE_CACHE 环境变量覆盖）
+        3. 用户主目录下的 .cache/huggingface/hub/ 文件夹（含 HF_HOME 环境变量覆盖）
 
     Args:
         model_name: 模型名称，如 'iic/mgeo_backbone_chinese_base'
@@ -170,7 +171,7 @@ class Config:
     
     # ==================== 批处理配置 ====================
     BATCH_SIZE_DB = 1000        # 数据库批量加载大小
-    BATCH_SIZE_EMBEDDING = 32   # 向量化批处理大小
+    BATCH_SIZE_EMBEDDING = 256   # 向量化批处理大小（GPU=256，CPU=128，由 embedding.py 根据设备自动选择）
     BATCH_SIZE_MODEL = 128       # 精排模型批处理大小（GPU默认128，CPU默认64，模型内部自动选择）
     
     # ==================== 匹配配置 ====================
@@ -182,6 +183,9 @@ class Config:
     MATCH_RESULTS_TABLE = 'match_results'
     RESULT_TABLE = 'match_results'  # 兼容旧代码使用
     MGEO_SIMILARITY_RESULTS_TABLE = 'mgeo_similarity_results'  # MGeo地址相似度匹配结果表
+    ADDRESS_TAGGING_RESULTS_TABLE = 'address_tagging_results'  # 地址12级结构化解析结果表
+    ADDRESS_TAGGING_17_RESULTS_TABLE = 'address_tagging_17_results'  # 地址17级结构化解析结果表
+    ADDRESS_TAGGING_17_2_RESULTS_TABLE = 'address_tagging_17_2_results'  # 地址17级双字段解析结果表
     
     # ==================== 日志配置 ====================
     LOG_LEVEL = 'WARNING'  # 精简日志，默认只记录 WARNING 及以上

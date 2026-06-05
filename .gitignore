@@ -62,3 +62,4 @@ desktop.ini
 
 # --- Skills lock (auto-managed) ---
 skills-lock.json
+.playwright-mcp/

@@ -14,8 +14,9 @@
 技术要点：
     - 使用 psycopg2 作为 PostgreSQL 驱动
     - 注册 pgvector 扩展以支持向量数据类型
-    - 支持连接池和自动重连机制
+    - 支持自动重连机制（execute 方法中检查连接状态）
     - 连接后自动设置 search_path，确保所有表操作在正确的 schema 下执行
+    - 使用 RealDictCursor 返回字典形式的查询结果
 """
 
 import psycopg2
@@ -50,9 +51,9 @@ class DBConnection:
         dbname: 数据库名称
         user: 数据库用户名
         password: 数据库密码
-        schema: 数据库模式（schema）
+        schema: 数据库模式（schema），默认为 'public'
         conn: psycopg2 连接对象
-        cursor: 数据库游标
+        cursor: 数据库游标（RealDictCursor，返回字典形式结果）
     """
     
     def __init__(self, host=None, port=None, dbname=None, user=None, password=None, schema=None):
@@ -133,9 +134,9 @@ class DBConnection:
     def _check_connection(self):
         """
         检查数据库连接是否正常
-        
+
         通过执行简单的 SELECT 1 查询来验证连接状态。
-        
+
         Returns:
             bool: 连接正常返回 True，否则返回 False
         """
@@ -143,6 +144,7 @@ class DBConnection:
             if self.conn:
                 cur = self.conn.cursor()
                 cur.execute("SELECT 1")
+                cur.fetchone()
                 cur.close()
                 return True
         except Exception:
@@ -152,26 +154,76 @@ class DBConnection:
     def execute(self, sql, params=None):
         """
         执行 SQL 语句
-        
+
         支持自动重连机制，如果连接断开会尝试重新连接。
-        
+        每次执行查询时创建新的 cursor，避免 cursor 状态污染导致的 'no results to fetch' 错误。
+
         Args:
             sql: SQL 语句
             params: SQL 参数（可选）
-        
+
         Returns:
             cursor: 执行成功返回游标对象，失败返回 None
         """
         try:
             # 检查连接状态，必要时重新连接
-            if not self.conn or not self._check_connection():
+            need_reconnect = not self.conn or not self._check_connection()
+            if need_reconnect:
                 if not self.connect():
                     return None
-            self.cursor.execute(sql, params)
-            return self.cursor
+            # 始终创建新的 cursor，避免复用已有 cursor 导致的状态问题
+            # 特别是避免之前执行过 CREATE TABLE 等 DDL 语句的 cursor 被复用
+            cursor = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(sql, params)
+            return cursor
         except Exception as e:
             logger.error(f"SQL execution error: {str(e)}")
+            # 回滚以重置连接事务状态，避免后续操作失败
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return None
+
+    def get_backend_pid(self):
+        """
+        获取当前连接对应的 PostgreSQL 后端进程 ID
+
+        Returns:
+            int: 后端 PID，连接不存在时返回 None
+        """
+        if self.conn:
+            return self.conn.get_backend_pid()
+        return None
+
+    def cancel_current_query(self):
+        """
+        取消当前连接上正在执行的查询
+
+        通过新建一个独立连接调用 pg_cancel_backend() 来取消查询。
+        成功取消后，被取消的查询会抛出异常，execute() 会捕获并回滚。
+
+        Returns:
+            bool: 成功发送取消信号返回 True
+        """
+        pid = self.get_backend_pid()
+        if not pid:
+            return False
+        try:
+            cancel_conn = psycopg2.connect(
+                host=self.host, port=self.port, dbname=self.dbname,
+                user=self.user, password=self.password
+            )
+            cancel_conn.set_session(autocommit=True)
+            cancel_cursor = cancel_conn.cursor()
+            cancel_cursor.execute(f"SELECT pg_cancel_backend({pid})")
+            cancel_cursor.close()
+            cancel_conn.close()
+            logger.info(f"已发送取消信号到后端进程 PID={pid}")
+            return True
+        except Exception as e:
+            logger.warning(f"取消后端查询失败: {e}")
+            return False
     
     def commit(self):
         """提交事务"""
@@ -211,19 +263,23 @@ class DBConnection:
     def get_tables(self):
         """
         获取数据库中指定模式下的所有表名
-        
+
         Returns:
             list: 表名列表
         """
         sql = """
-            SELECT table_name 
-            FROM information_schema.tables 
+            SELECT table_name
+            FROM information_schema.tables
             WHERE table_schema = %s
         """
-        cursor = self.execute(sql, (self.schema,))
-        if cursor:
-            return [row['table_name'] for row in cursor.fetchall()]
-        return []
+        try:
+            cursor = self.execute(sql, (self.schema,))
+            if cursor:
+                return [row['table_name'] for row in cursor.fetchall()]
+            return []
+        except Exception as e:
+            logger.error(f"get_tables failed: {e}")
+            raise
     
     def table_exists(self, table_name):
         """

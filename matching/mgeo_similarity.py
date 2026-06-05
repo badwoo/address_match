@@ -13,11 +13,11 @@ MGeo地址相似度匹配模块
 
 匹配逻辑：
     - 每行数据中地址A和地址B组成一个地址对
-    - 模型返回三个概率: exact_match, partial_match, not_match
+    - 模型返回三个概率: not_match(索引0)、partial_match(索引1)、exact_match(索引2)
     - 三个概率值中取最大值对应的状态作为匹配结果：
-      exact_match最大 → 精确匹配
-      partial_match最大 → 部分匹配
-      not_match最大 → 不匹配
+      exact_match 最大 → 精确匹配
+      partial_match 最大 → 部分匹配
+      not_match 最大 → 不匹配
 """
 
 import time
@@ -33,9 +33,9 @@ def determine_similarity_status(exact_match, partial_match, not_match):
     根据exact_match、partial_match、not_match三个概率值判断匹配状态
 
     判断逻辑：三个概率值中哪个最大，状态就是哪个
-        - exact_match最大 → 精确匹配
-        - partial_match最大 → 部分匹配
-        - not_match最大 → 不匹配
+        - exact_match 最大 → 精确匹配
+        - partial_match 最大 → 部分匹配
+        - not_match 最大 → 不匹配
 
     Args:
         exact_match: 精确匹配概率
@@ -181,29 +181,41 @@ class MGeoSimilarityMatcher:
         self._update_status(is_running=False)
         logger.info("[MGeo相似度匹配] 用户停止了匹配")
 
-    def match_from_dataframe(self, df, address_a_col, address_b_col, batch_size=None):
+    def match_from_dataframe(self, df, address_a_col, address_b_col, id_col=None, batch_size=None):
         """
         从DataFrame进行MGeo地址相似度匹配
 
         性能优化：
             1. batch_size默认由模型根据设备自动选择（GPU=128, CPU=64）
             2. 先过滤空地址，收集所有有效地址对后一次性批量预测
-            3. 减少多次小批量调用带来的GPU空闲开销
+            3. 用向量化操作替代全量 list 拷贝，减少内存峰值
 
         Args:
             df: 包含地址数据的DataFrame
             address_a_col: 地址A字段列名
             address_b_col: 地址B字段列名
+            id_col: 可选的标识字段列名
             batch_size: 模型批处理大小，默认None（由模型自动选择）
 
         Returns:
-            list: 匹配结果列表，每个元素包含 address_a, address_b, exact_match, partial_match, not_match, match_status
+            list: 匹配结果列表
         """
         self._load_model()
 
-        addresses_a = df[address_a_col].fillna('').astype(str).tolist()
-        addresses_b = df[address_b_col].fillna('').astype(str).tolist()
-        total = len(addresses_a)
+        # 使用 Series 向量化操作，避免全量 .tolist() 拷贝
+        addr_a_series = df[address_a_col].fillna('').astype(str)
+        addr_b_series = df[address_b_col].fillna('').astype(str)
+        total = len(df)
+
+        if id_col and id_col in df.columns:
+            id_series = df[id_col].fillna('').astype(str)
+        else:
+            id_series = pd.Series('', index=df.index)
+
+        # 向量化空值检测
+        valid_mask = addr_a_series.str.strip().str.len().gt(0) & addr_b_series.str.strip().str.len().gt(0)
+        valid_idx = valid_mask[valid_mask].index.tolist()
+        invalid_idx = valid_mask[~valid_mask].index.tolist()
 
         self._update_status(
             is_running=True,
@@ -214,36 +226,36 @@ class MGeoSimilarityMatcher:
         )
 
         results = [None] * total
-        valid_pairs = []
-        valid_indices = []
 
-        for idx in range(total):
-            a = addresses_a[idx]
-            b = addresses_b[idx]
-            if a.strip() and b.strip():
-                valid_pairs.append((a, b))
-                valid_indices.append(idx)
-            else:
-                results[idx] = {
-                    'address_a': a,
-                    'address_b': b,
-                    'exact_match': 0.0,
-                    'partial_match': 0.0,
-                    'not_match': 1.0,
-                    'match_status': '不匹配'
-                }
+        # 空地址行直接标记为不匹配
+        for idx in invalid_idx:
+            results[idx] = {
+                'address_a': addr_a_series.iat[idx],
+                'address_b': addr_b_series.iat[idx],
+                'identifier': id_series.iat[idx] or None,
+                'exact_match': 0.0,
+                'partial_match': 0.0,
+                'not_match': 1.0,
+                'match_status': '不匹配'
+            }
 
         start_time = time.time()
 
-        if valid_pairs:
+        if valid_idx:
+            # 仅为有效行构建地址对列表
+            valid_a = addr_a_series.iloc[valid_idx].tolist()
+            valid_b = addr_b_series.iloc[valid_idx].tolist()
+            valid_pairs = list(zip(valid_a, valid_b))
+
             try:
                 predictions = self.model.predict(valid_pairs, batch_size=batch_size)
             except Exception as e:
                 logger.error(f"[MGeo相似度匹配] 批量预测失败: {str(e)}")
-                for idx in valid_indices:
+                for idx in valid_idx:
                     results[idx] = {
-                        'address_a': addresses_a[idx],
-                        'address_b': addresses_b[idx],
+                        'address_a': addr_a_series.iat[idx],
+                        'address_b': addr_b_series.iat[idx],
+                        'identifier': id_series.iat[idx] or None,
                         'exact_match': 0.0,
                         'partial_match': 0.0,
                         'not_match': 1.0,
@@ -257,14 +269,15 @@ class MGeoSimilarityMatcher:
                 )
                 return results
 
-            for pair_idx, result_idx in enumerate(valid_indices):
+            for pair_idx, result_idx in enumerate(valid_idx):
                 pred = predictions[pair_idx]
                 match_status = determine_similarity_status(
                     pred['exact_match'], pred['partial_match'], pred['not_match']
                 )
                 results[result_idx] = {
-                    'address_a': addresses_a[result_idx],
-                    'address_b': addresses_b[result_idx],
+                    'address_a': addr_a_series.iat[result_idx],
+                    'address_b': addr_b_series.iat[result_idx],
+                    'identifier': id_series.iat[result_idx] or None,
                     'exact_match': pred['exact_match'],
                     'partial_match': pred['partial_match'],
                     'not_match': pred['not_match'],
@@ -286,7 +299,7 @@ class MGeoSimilarityMatcher:
         logger.info(f"[MGeo相似度匹配] 完成，共处理 {total} 条记录，耗时 {elapsed:.2f}s，速度 {speed:.1f}条/秒")
         return results
 
-    def match_from_file(self, file_path, address_a_col, address_b_col, batch_size=None):
+    def match_from_file(self, file_path, address_a_col, address_b_col, id_col=None, batch_size=None):
         """
         从文件（Excel/CSV）进行MGeo地址相似度匹配
 
@@ -294,6 +307,7 @@ class MGeoSimilarityMatcher:
             file_path: 文件路径
             address_a_col: 地址A字段列名
             address_b_col: 地址B字段列名
+            id_col: 可选的标识字段列名
             batch_size: 模型批处理大小
 
         Returns:
@@ -310,10 +324,12 @@ class MGeoSimilarityMatcher:
             raise ValueError(f"文件中未找到地址A字段: {address_a_col}")
         if address_b_col not in df.columns:
             raise ValueError(f"文件中未找到地址B字段: {address_b_col}")
+        if id_col and id_col not in df.columns:
+            raise ValueError(f"文件中未找到标识字段: {id_col}")
 
-        return self.match_from_dataframe(df, address_a_col, address_b_col, batch_size)
+        return self.match_from_dataframe(df, address_a_col, address_b_col, id_col, batch_size)
 
-    def match_from_db_table(self, db_conn, table_name, address_a_col, address_b_col, batch_size=None):
+    def match_from_db_table(self, db_conn, table_name, address_a_col, address_b_col, id_col=None, batch_size=None):
         """
         从数据库表进行MGeo地址相似度匹配
 
@@ -322,6 +338,7 @@ class MGeoSimilarityMatcher:
             table_name: 表名
             address_a_col: 地址A字段名
             address_b_col: 地址B字段名
+            id_col: 可选的标识字段名
             batch_size: 模型批处理大小
 
         Returns:
@@ -343,12 +360,14 @@ class MGeoSimilarityMatcher:
             raise ValueError(f"表中未找到地址A字段: {address_a_col}")
         if address_b_col not in df.columns:
             raise ValueError(f"表中未找到地址B字段: {address_b_col}")
+        if id_col and id_col not in df.columns:
+            raise ValueError(f"表中未找到标识字段: {id_col}")
 
-        return self.match_from_dataframe(df, address_a_col, address_b_col, batch_size)
+        return self.match_from_dataframe(df, address_a_col, address_b_col, id_col, batch_size)
 
 
 def run_mgeo_similarity_async(matcher, data_source, address_a_col, address_b_col,
-                               db_conn=None, table_name=None, result_table_name=None,
+                               id_col=None, db_conn=None, table_name=None, result_table_name=None,
                                completed_callback=None):
     """
     异步执行MGeo地址相似度匹配
@@ -358,6 +377,7 @@ def run_mgeo_similarity_async(matcher, data_source, address_a_col, address_b_col
         data_source: 数据源（DataFrame 或文件路径）
         address_a_col: 地址A字段名
         address_b_col: 地址B字段名
+        id_col: 可选的标识字段名
         db_conn: 数据库连接对象（库表输入时需要）
         table_name: 数据库表名（库表输入时需要）
         result_table_name: 结果表名
@@ -373,19 +393,17 @@ def run_mgeo_similarity_async(matcher, data_source, address_a_col, address_b_col
             matcher._update_status(is_running=True, status_message='正在加载数据...')
 
             if isinstance(data_source, pd.DataFrame):
-                results = matcher.match_from_dataframe(data_source, address_a_col, address_b_col)
+                results = matcher.match_from_dataframe(data_source, address_a_col, address_b_col, id_col)
             elif isinstance(data_source, str):
-                results = matcher.match_from_file(data_source, address_a_col, address_b_col)
+                results = matcher.match_from_file(data_source, address_a_col, address_b_col, id_col)
             else:
                 raise ValueError("不支持的数据源类型")
 
             if not results:
-                matcher._update_status(
-                    is_running=False,
-                    status_message='无匹配结果',
-                    error_message='没有可匹配的数据'
-                )
                 with matcher._lock:
+                    matcher.is_running = False
+                    matcher.status_message = '无匹配结果'
+                    matcher.error_message = '没有可匹配的数据'
                     matcher.completed = True
                     matcher.completion_success = False
                     matcher.completion_message = '没有可匹配的数据'
@@ -397,6 +415,12 @@ def run_mgeo_similarity_async(matcher, data_source, address_a_col, address_b_col
             source_table = table_name or ''
 
             if db_conn:
+                # match_from_dataframe 已将 is_running 设为 False，重新标记为运行中
+                matcher._update_status(
+                    is_running=True,
+                    status_message='正在写入匹配结果到数据库...'
+                )
+
                 data_loader = DataLoader(db_conn)
                 target_table = result_table_name or Config.MGEO_SIMILARITY_RESULTS_TABLE
 
@@ -420,13 +444,12 @@ def run_mgeo_similarity_async(matcher, data_source, address_a_col, address_b_col
                     else:
                         logger.warning("[MGeo相似度匹配] 副本表创建失败")
 
+            # 原子设置所有完成状态字段，消除竞态条件
             end_time = time.time()
-            matcher._update_status(
-                is_running=False,
-                progress=1.0,
-                status_message='MGeo相似度匹配完成'
-            )
             with matcher._lock:
+                matcher.is_running = False
+                matcher.progress = 1.0
+                matcher.status_message = 'MGeo相似度匹配完成'
                 matcher.completed = True
                 matcher.completion_success = True
                 matcher.completion_message = '匹配完成'
@@ -443,12 +466,10 @@ def run_mgeo_similarity_async(matcher, data_source, address_a_col, address_b_col
             import traceback
             logger.error(f"[MGeo相似度匹配] 详细堆栈: {traceback.format_exc()}")
             end_time = time.time()
-            matcher._update_status(
-                is_running=False,
-                error_message=str(e),
-                status_message='MGeo相似度匹配失败'
-            )
             with matcher._lock:
+                matcher.is_running = False
+                matcher.error_message = str(e)
+                matcher.status_message = 'MGeo相似度匹配失败'
                 matcher.completed = True
                 matcher.completion_success = False
                 matcher.completion_message = str(e)

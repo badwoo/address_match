@@ -134,6 +134,82 @@ class VectorStore:
             return True
         return False
     
+    def _detect_vector_index_type(self, table_name):
+        """
+        检测表中向量索引的类型（hnsw / ivfflat / none）
+
+        通过查询 pg_indexes 的 indexdef 字段判断索引类型。
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            str: 'hnsw'、'ivfflat' 或 'none'
+        """
+        try:
+            idx_sql = """
+                SELECT indexdef
+                FROM pg_indexes
+                WHERE schemaname = %s AND tablename = %s
+            """
+            cursor = self.db.execute(idx_sql, (self.db.schema, table_name))
+            if cursor:
+                for row in cursor.fetchall():
+                    idx_def = row['indexdef'].lower()
+                    if 'hnsw' in idx_def:
+                        return 'hnsw'
+                    if 'ivfflat' in idx_def:
+                        return 'ivfflat'
+        except Exception as e:
+            logger.warning(f"检测索引类型失败 {table_name}: {e}")
+        return 'none'
+
+    def _set_index_search_param(self, table_name, top_n):
+        """
+        根据表的向量索引类型，设置对应的查询参数以确保召回数量充足
+
+        HNSW 索引：设置 hnsw.ef_search >= top_n（默认值128，当 top_n > 128 时必须调大）
+        IVFFlat 索引：设置 ivfflat.probes（默认值1，建议设为 sqrt(lists) 以提高召回率）
+        无索引：不设置
+
+        Args:
+            table_name: 表名
+            top_n: 期望召回的数量
+        """
+        index_type = self._detect_vector_index_type(table_name)
+
+        if index_type == 'hnsw':
+            ef_search = max(top_n, 128)
+            self.db.execute(f"SET hnsw.ef_search = {ef_search}")
+            logger.info(f"SET hnsw.ef_search = {ef_search} (top_n={top_n})")
+        elif index_type == 'ivfflat':
+            try:
+                idx_sql = """
+                    SELECT indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = %s AND tablename = %s AND indexdef ILIKE '%%ivfflat%%'
+                """
+                cursor = self.db.execute(idx_sql, (self.db.schema, table_name))
+                if cursor:
+                    row = cursor.fetchone()
+                    if row:
+                        import re
+                        match = re.search(r'lists\s*=\s*(\d+)', row['indexdef'], re.IGNORECASE)
+                        if match:
+                            lists = int(match.group(1))
+                            probes = max(1, int(lists ** 0.5))
+                            self.db.execute(f"SET ivfflat.probes = {probes}")
+                            logger.info(f"SET ivfflat.probes = {probes} (lists={lists})")
+                        else:
+                            self.db.execute("SET ivfflat.probes = 10")
+                            logger.info("SET ivfflat.probes = 10 (lists未知，使用默认值)")
+            except Exception as e:
+                logger.warning(f"设置 ivfflat.probes 失败: {e}")
+                self.db.execute("SET ivfflat.probes = 10")
+                logger.info("SET ivfflat.probes = 10 (回退默认值)")
+        else:
+            logger.info(f"表 {table_name} 无向量索引，使用顺序扫描")
+
     def check_index_exists(self, table_name, index_name):
         """
         检查索引是否已存在
@@ -237,14 +313,14 @@ class VectorStore:
                 sql = f"""
                     CREATE INDEX {index_name}
                     ON {table_name}
-                    USING ivfflat (vector vector_cosine_ops)
+                    USING ivfflat (vector vector_l2_ops)
                     WITH (lists = {lists})
                 """
             elif index_type == 'hnsw':
                 sql = f"""
                     CREATE INDEX {index_name}
                     ON {table_name}
-                    USING hnsw (vector vector_cosine_ops)
+                    USING hnsw (vector vector_l2_ops)
                     WITH (m = {m}, ef_construction = {ef_construction})
                 """
             else:
@@ -272,20 +348,25 @@ class VectorStore:
     
     @staticmethod
     def _vector_to_pg_string(vec):
-        """
-        将 numpy 向量转为 pgvector 兼容的字符串格式。
-        使用 numpy 的 C 级别 vectorized 操作，比逐元素 repr() 快 10-20x。
-
-        Args:
-            vec: numpy 数组，形状为 (dim,) 或 (1, dim)
-
-        Returns:
-            str: 如 '[0.12345678,-0.87654321,...]'
-        """
         arr = np.asarray(vec, dtype=np.float32).ravel()
         return np.array2string(arr, separator=',', max_line_width=np.inf,
                                threshold=np.inf, floatmode='fixed',
                                formatter={'float_kind': lambda x: f'{x:.8f}'})
+
+    @staticmethod
+    def _vectors_to_pg_strings(vectors):
+        arr = np.asarray(vectors, dtype=np.float32)
+        if arr.ndim == 1:
+            return [VectorStore._vector_to_pg_string(arr)]
+        n = arr.shape[0]
+        results = [None] * n
+        for i in range(n):
+            results[i] = np.array2string(
+                arr[i], separator=',', max_line_width=np.inf,
+                threshold=np.inf, floatmode='fixed',
+                formatter={'float_kind': lambda x: f'{x:.8f}'}
+            )
+        return results
 
     def insert_vectors(self, vectors, source_ids, addresses, table_name=None,
                        extra_data=None, table_type='enterprise',
@@ -294,7 +375,7 @@ class VectorStore:
         批量插入向量数据（高性能版）。
 
         优化点：
-        - 使用 numpy vectorized 操作构建向量字符串（无 Python 逐元素循环）
+        - 向量字符串转换使用 numpy vectorized 操作（比逐元素 repr() 快 10-20x）
         - 临时关闭 autocommit，批量事务提交（默认每 10 chunk/5万条 commit 一次）
         - finally 块确保 autocommit 一定恢复
 
@@ -314,6 +395,8 @@ class VectorStore:
         table_name = table_name or self.table_name
         if len(vectors) == 0:
             return 0
+
+        source_ids = [str(sid) for sid in source_ids]
 
         actual_dim = vectors.shape[1] if len(vectors.shape) > 1 else len(vectors[0])
         total = len(vectors)
@@ -348,17 +431,17 @@ class VectorStore:
         try:
             for chunk_idx, chunk_start in enumerate(range(0, total, insert_chunk_size)):
                 chunk_end = min(chunk_start + insert_chunk_size, total)
+                chunk_vectors = vectors[chunk_start:chunk_end]
+                vec_strs = self._vectors_to_pg_strings(chunk_vectors)
+
                 values = []
-
-                for i in range(chunk_start, chunk_end):
-                    vec_str = self._vector_to_pg_string(vectors[i])
-
+                for i, idx in enumerate(range(chunk_start, chunk_end)):
                     if table_type == 'enterprise':
-                        enterprise_name = extra_data[i] if extra_data else ''
-                        values.append((source_ids[i], enterprise_name, addresses[i], vec_str))
+                        enterprise_name = extra_data[idx] if extra_data else ''
+                        values.append((source_ids[idx], enterprise_name, addresses[idx], vec_strs[i]))
                     else:
-                        room_no = extra_data[i] if extra_data else ''
-                        values.append((source_ids[i], addresses[i], room_no, vec_str))
+                        room_no = extra_data[idx] if extra_data else ''
+                        values.append((source_ids[idx], addresses[idx], room_no, vec_strs[i]))
 
                 psycopg2.extras.execute_values(
                     self.db.cursor, sql, values, template=template, page_size=1000
@@ -408,7 +491,7 @@ class VectorStore:
         try:
             for source_id in sample_ids:
                 sql = f"""
-                    SELECT source_id, address, vector <#> vector as self_inner_product
+                    SELECT source_id, address, 1 - ((vector <-> vector)^2 / 2.0) as self_inner_product
                     FROM {table_name}
                     WHERE source_id = %s
                 """
@@ -419,7 +502,6 @@ class VectorStore:
                         sid = row['source_id']
                         addr = row['address']
                         self_ip = row['self_inner_product']
-                        # 自身内积应该接近1.0（如果向量已归一化）
                         if self_ip is not None:
                             if abs(self_ip - 1.0) < 0.1:
                                 logger.info(f"✓ 向量验证通过 - ID:{sid}, 自身内积:{self_ip:.8f}")
@@ -434,7 +516,9 @@ class VectorStore:
         """
         向量相似性搜索
         
-        使用 pgvector 的余弦距离操作符进行近似最近邻搜索。
+        使用 pgvector 的 L2 距离操作符（<->）进行近似最近邻搜索。
+        向量已归一化，L2 距离排序与余弦相似度排序等价，
+        通过公式 1 - (L2_distance^2 / 2) 将 L2 距离转换为余弦相似度。
         
         Args:
             query_vector: 查询向量
@@ -447,10 +531,12 @@ class VectorStore:
         table_name = table_name or self.table_name
         query_vector = np.array(query_vector)
         
+        self._set_index_search_param(table_name, top_n)
+
         sql = f"""
-            SELECT source_id, address, 1 - (vector <=> %s) as similarity
+            SELECT source_id, address, 1 - ((vector <-> %s) ^ 2) / 2.0 as similarity
             FROM {table_name}
-            ORDER BY vector <=> %s
+            ORDER BY vector <-> %s
             LIMIT %s
         """
         
@@ -472,6 +558,9 @@ class VectorStore:
         批量召回 - 为每个企业检索最相似的标准地址候选
         
         阶段1（粗召回）的核心方法，使用 SQL JOIN LATERAL 实现高效的批量向量相似性检索。
+        使用 L2 距离（欧氏距离）排序召回，通过公式转换为余弦相似度：
+        similarity = 1 - (L2_distance^2 / 2)，归一化向量 L2 距离范围为 [0, 2]，
+        对应余弦相似度范围为 [0, 1]。
         
         Args:
             enterprise_table: 企业向量表名
@@ -484,28 +573,30 @@ class VectorStore:
         """
         logger.info(f"Starting batch recall from {enterprise_table} to {standard_table}, top_n={top_n}, threshold={similarity_threshold}")
         
+        self._set_index_search_param(standard_table, top_n)
+
         threshold_condition = ""
         if similarity_threshold is not None:
-            threshold_condition = f"WHERE 1 - (c.vector <=> a.vector) >= {float(similarity_threshold)}"
-        
+            threshold_condition = f"WHERE 1 - ((c.vector <-> a.vector) ^ 2) / 2.0 >= {float(similarity_threshold)}"
+
         sql = f"""
-            SELECT 
+            SELECT
                 c.source_id AS enterprise_id,
                 c.enterprise_name,
                 c.address AS enterprise_address,
                 a.source_id AS standard_id,
                 a.address AS standard_address,
                 a.room_no,
-                1 - (c.vector <=> a.vector) AS similarity
+                1 - ((c.vector <-> a.vector) ^ 2) / 2.0 AS similarity
             FROM {enterprise_table} c
             JOIN LATERAL (
-                SELECT 
+                SELECT
                     source_id,
                     address,
                     room_no,
                     vector
                 FROM {standard_table}
-                ORDER BY c.vector <=> vector
+                ORDER BY c.vector <-> vector
                 LIMIT {top_n}
             ) a ON true
             {threshold_condition}
@@ -603,36 +694,77 @@ class VectorStore:
     
     def get_vector_tables(self):
         """
-        获取所有向量表名（表名包含 'vector'）
-        
+        获取所有向量表名（表名包含 'vector'），按创建时间倒序排列（最新创建的排最前）
+
         Returns:
             list: 向量表名列表
         """
         sql = """
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = %s 
-            AND table_name LIKE '%%vector%%'
+            SELECT c.relname AS table_name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+            AND c.relname LIKE '%%vector%%'
+            AND c.relkind = 'r'
+            ORDER BY c.oid DESC
         """
         cursor = self.db.execute(sql, (self.db.schema,))
         if cursor:
             return [row['table_name'] for row in cursor.fetchall()]
         return []
+
+    def rename_vector_table(self, old_name, new_name):
+        """
+        重命名向量表
+
+        Args:
+            old_name: 原表名
+            new_name: 新表名
+
+        Returns:
+            bool: 重命名成功返回 True
+        """
+        sql = f"ALTER TABLE {old_name} RENAME TO {new_name}"
+        cursor = self.db.execute(sql)
+        if cursor:
+            self.db.commit()
+            logger.info(f"Vector table renamed from {old_name} to {new_name}")
+            return True
+        return False
+
+    def check_table_exists(self, table_name):
+        """
+        检查表是否存在
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            bool: 存在返回 True
+        """
+        sql = """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+        """
+        cursor = self.db.execute(sql, (self.db.schema, table_name))
+        if cursor and cursor.fetchone():
+            return True
+        return False
     
     def check_vector_table_dimension(self, table_name):
         """
         检查向量表的向量维度
-        
+
         Args:
             table_name: 表名
-        
+
         Returns:
             int: 向量维度，如果表不存在或无向量字段返回 None
         """
         sql = """
-            SELECT atttypmod 
-            FROM pg_attribute 
-            WHERE attrelid = %s::regclass 
+            SELECT atttypmod
+            FROM pg_attribute
+            WHERE attrelid = %s::regclass
             AND attname = 'vector'
         """
         cursor = self.db.execute(sql, (table_name,))
@@ -641,6 +773,91 @@ class VectorStore:
             if result and result['atttypmod']:
                 return result['atttypmod']
         return None
+
+    def get_vector_table_detail(self, table_name):
+        """
+        获取向量表的详细信息
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            dict: 包含表详细信息的字典，失败返回 None
+                - table_name: 表名
+                - row_count: 数据行数
+                - vector_dim: 向量维度
+                - columns: 字段列表 [(字段名, 数据类型), ...]
+                - indexes: 索引列表 [(索引名, 索引类型), ...]
+                - table_size: 表大小（可读格式）
+                - created_at: 最早创建时间
+        """
+        try:
+            # 数据行数
+            row_count = self.get_vector_count(table_name)
+
+            # 向量维度
+            vector_dim = self.check_vector_table_dimension(table_name)
+
+            # 字段信息
+            col_sql = """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """
+            cursor = self.db.execute(col_sql, (self.db.schema, table_name))
+            columns = [(row['column_name'], row['data_type']) for row in cursor.fetchall()] if cursor else []
+
+            # 索引信息
+            idx_sql = """
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE schemaname = %s AND tablename = %s
+            """
+            cursor = self.db.execute(idx_sql, (self.db.schema, table_name))
+            indexes = []
+            if cursor:
+                for row in cursor.fetchall():
+                    idx_name = row['indexname']
+                    idx_def = row['indexdef']
+                    # 从 indexdef 中提取索引类型
+                    idx_type = 'btree'
+                    if 'ivfflat' in idx_def.lower():
+                        idx_type = 'ivfflat'
+                    elif 'hnsw' in idx_def.lower():
+                        idx_type = 'hnsw'
+                    elif 'gin' in idx_def.lower():
+                        idx_type = 'gin'
+                    elif 'gist' in idx_def.lower():
+                        idx_type = 'gist'
+                    indexes.append((idx_name, idx_type))
+
+            # 表大小
+            size_sql = """
+                SELECT pg_size_pretty(pg_total_relation_size(%s::regclass)) as size
+            """
+            cursor = self.db.execute(size_sql, (table_name,))
+            table_size = cursor.fetchone()['size'] if cursor else '未知'
+
+            # 最早创建时间
+            time_sql = f"""
+                SELECT MIN(created_at) as created_at FROM {table_name}
+            """
+            cursor = self.db.execute(time_sql)
+            created_at = cursor.fetchone()['created_at'] if cursor else None
+
+            return {
+                'table_name': table_name,
+                'row_count': row_count,
+                'vector_dim': vector_dim,
+                'columns': columns,
+                'indexes': indexes,
+                'table_size': table_size,
+                'created_at': created_at
+            }
+        except Exception as e:
+            logger.error(f"获取向量表详情失败 {table_name}: {e}")
+            return None
 
     def disable_autovacuum(self, table_name):
         """

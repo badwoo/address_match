@@ -9,8 +9,8 @@
     2. 批量地址匹配 - 对多个查询地址进行批量精排
 
 匹配逻辑：
-    - MGeo模型返回三个概率: exact_match, not_match, partial_match
-    - 候选排序：按 exact_match 最大值筛选，相同时取 not_match 最小的候选
+    - MGeo模型返回三个概率: not_match(索引0)、partial_match(索引1)、exact_match(索引2)
+    - 候选排序：四舍五入保留两位小数后比较，优先 exact_match 最高 → partial_match 最高 → not_match 最低
     - match_status 判断: exact_match、partial_match、not_match 三者中数值最大的决定状态
       - exact_match 最大 → '精确匹配'
       - partial_match 最大 → '部分匹配'
@@ -29,9 +29,9 @@ def determine_match_status(exact_match_score, partial_match_score, not_match_sco
 
     判断逻辑：
         取三个分数中最大值对应的标签作为匹配状态：
-        - exact_match最大 → '精确匹配'
-        - partial_match最大 → '部分匹配'
-        - not_match最大 → '不匹配'
+        - exact_match 最大 → '精确匹配'
+        - partial_match 最大 → '部分匹配'
+        - not_match 最大 → '不匹配'
 
     Args:
         exact_match_score: 精确匹配概率
@@ -79,8 +79,9 @@ class RankingEngine:
         对单个查询地址进行精排
 
         筛选逻辑：
-            1. 先按相似度阈值过滤低分候选
-            2. 按 exact_match 最大值筛选最佳匹配候选，相同时取 not_match 最小的候选
+            1. 先按向量相似度阈值过滤低分候选（粗召回阶段的相似度）
+            2. 使用MGeo模型预测后，按四舍五入保留两位小数的 exact_match 最大值筛选最佳匹配，
+               exact_match 相同时取 partial_match 最大值，还相同时取 not_match 最小值
 
         Args:
             query_address: 查询地址
@@ -104,16 +105,21 @@ class RankingEngine:
         pairs = [(query_address, candidate['address']) for candidate in candidates]
         predictions = self.model.predict(pairs)
 
-        best_score = -1.0
-        best_not_match = float('inf')
+        best_exact = -1.0
+        best_partial = -1.0
+        best_not = float('inf')
         best_idx = -1
 
         for i, pred in enumerate(predictions):
-            score = pred['exact_match']
-            not_match = pred['not_match']
-            if score > best_score or (score == best_score and not_match < best_not_match):
-                best_score = score
-                best_not_match = not_match
+            r_exact = round(pred['exact_match'], 2)
+            r_partial = round(pred['partial_match'], 2)
+            r_not = round(pred['not_match'], 2)
+            if (r_exact > best_exact or
+                (r_exact == best_exact and r_partial > best_partial) or
+                (r_exact == best_exact and r_partial == best_partial and r_not < best_not)):
+                best_exact = r_exact
+                best_partial = r_partial
+                best_not = r_not
                 best_idx = i
 
         pred = predictions[best_idx]
@@ -258,16 +264,21 @@ class RankingEngine:
                 start_idx, end_idx, candidates = mapping
                 enterprise_predictions = predictions[start_idx:end_idx]
                 
-                best_score = -1.0
-                best_not_match = float('inf')
+                best_exact = -1.0
+                best_partial = -1.0
+                best_not = float('inf')
                 best_idx = -1
-                
+
                 for i, pred in enumerate(enterprise_predictions):
-                    score = pred['exact_match']
-                    not_match = pred['not_match']
-                    if score > best_score or (score == best_score and not_match < best_not_match):
-                        best_score = score
-                        best_not_match = not_match
+                    r_exact = round(pred['exact_match'], 2)
+                    r_partial = round(pred['partial_match'], 2)
+                    r_not = round(pred['not_match'], 2)
+                    if (r_exact > best_exact or
+                        (r_exact == best_exact and r_partial > best_partial) or
+                        (r_exact == best_exact and r_partial == best_partial and r_not < best_not)):
+                        best_exact = r_exact
+                        best_partial = r_partial
+                        best_not = r_not
                         best_idx = i
                 
                 best_pred = enterprise_predictions[best_idx]

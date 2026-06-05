@@ -1,31 +1,33 @@
 """
-中文转拼音工具模块
-================
+标签转拼音工具模块
+==============
 
 将中文标签转为拼音前缀，用于生成数据库表名前缀。
 
 核心功能：
-    1. tag_to_prefix - 将标签转为表名前缀（中文转拼音，英文保持原样）
+    1. tag_to_prefix - 将标签转为表名前缀（中文转拼音，英文/数字保持原样）
     2. get_tag_tables - 根据标签前缀生成对应的 recall 和 match 表名
+    3. get_existing_tags - 从数据库中检索所有已有标签前缀
 """
 
 import re
+from pypinyin import lazy_pinyin, Style
 
-# 常用汉字拼音映射表（覆盖常见地名用字）
+# 常用汉字拼音映射表（覆盖常见地名用字，作为 pypinyin 的回退）
 _HANZI_PINYIN = {
     '福': 'fu', '田': 'tian', '罗': 'luo', '湖': 'hu', '南': 'nan', '北': 'bei',
     '东': 'dong', '西': 'xi', '山': 'shan', '龙': 'long', '华': 'hua', '宝': 'bao',
     '安': 'an', '新': 'xin', '深': 'shen', '圳': 'zhen', '广': 'guang', '州': 'zhou',
-    '上': 'shang', '海': 'hai', '北': 'bei', '京': 'jing', '天': 'tian', '津': 'jin',
+    '上': 'shang', '海': 'hai', '京': 'jing', '天': 'tian', '津': 'jin',
     '重': 'chong', '庆': 'qing', '杭': 'hang', '苏': 'su', '成': 'cheng', '都': 'du',
-    '武': 'wu', '汉': 'han', '南': 'nan', '京': 'jing', '西': 'xi', '郑': 'zheng',
+    '武': 'wu', '汉': 'han', '郑': 'zheng',
     '长': 'chang', '沙': 'sha', '沈': 'shen', '阳': 'yang', '大': 'da', '连': 'lian',
     '青': 'qing', '岛': 'dao', '厦': 'xia', '门': 'men', '宁': 'ning', '波': 'bo',
-    '济': 'ji', '无': 'wu', '锡': 'xi', '常': 'chang', '州': 'zhou', '南': 'nan',
+    '济': 'ji', '无': 'wu', '锡': 'xi', '常': 'chang', '州': 'zhou',
     '通': 'tong', '徐': 'xu', '温': 'wen', '合': 'he', '肥': 'fei', '昆': 'kun',
-    '明': 'ming', '哈': 'ha', '尔': 'er', '滨': 'bin', '东': 'dong', '莞': 'guan',
+    '明': 'ming', '哈': 'ha', '尔': 'er', '滨': 'bin', '莞': 'guan',
     '佛': 'fo', '中': 'zhong', '珠': 'zhu', '惠': 'hui', '汕': 'shan', '头': 'tou',
-    '三': 'san', '亚': 'ya', '桂': 'gui', '林': 'lin', '南': 'nan', '宁': 'ning',
+    '三': 'san', '亚': 'ya', '桂': 'gui', '林': 'lin',
     '贵': 'gui', '阳': 'yang', '兰': 'lan', '太': 'tai', '原': 'yuan', '石': 'shi',
     '家': 'jia', '庄': 'zhuang', '呼': 'hu', '和': 'he', '浩': 'hao', '特': 'te',
     '银': 'yin', '川': 'chuan', '乌': 'wu', '鲁': 'lu', '木': 'mu', '齐': 'qi',
@@ -102,21 +104,22 @@ def tag_to_prefix(tag):
         prefix = re.sub(r'[^a-zA-Z0-9_]', '_', tag).lower().strip('_')
         return prefix if prefix else 'default'
 
-    # 中文标签，逐字转拼音
+    # 使用 pypinyin 将整个标签转为拼音，逐个字符处理
     result = []
     for char in tag:
         if '一' <= char <= '鿿':
-            py = _HANZI_PINYIN.get(char)
-            if py:
-                result.append(py)
+            py_list = lazy_pinyin(char, style=Style.NORMAL)
+            if py_list and py_list[0]:
+                result.append(py_list[0])
             else:
-                # 未收录的汉字，使用其 Unicode 码点作为后备
-                result.append(f'z{ord(char):x}')
+                # pypinyin 未返回结果时，回退到手动字典或 Unicode 码点
+                py = _HANZI_PINYIN.get(char)
+                result.append(py if py else f'z{ord(char):x}')
         elif char.isalpha() or char.isdigit():
             result.append(char.lower())
         elif char in ('_', '-'):
             result.append('_')
-    # 移除空白和特殊字符
+
     prefix = re.sub(r'_+', '_', ''.join(result)).strip('_')
     return prefix if prefix else 'default'
 

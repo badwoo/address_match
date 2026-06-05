@@ -7,15 +7,17 @@
     阶段2（精排）：使用MGeo地址相似度匹配模型对召回结果进行精准排序
 
 核心功能：
-    1. 批量召回 - 使用SQL向量化查询实现高效召回
-    2. MGeo精排 - 使用阿里MGeo地址匹配模型进行精准匹配
-    3. 异步执行 - 支持后台异步执行匹配任务
-    4. 任务控制 - 支持暂停、恢复、停止匹配任务
+    1. 批量召回 - 使用SQL JOIN LATERAL实现高效的批量向量相似性检索
+    2. MGeo精排 - 使用阿里MGeo地址相似度匹配模型对召回结果进行精准排序
+    3. 异步执行 - 支持后台异步执行匹配任务（粗召回和精排可独立异步执行）
+    4. 任务控制 - 支持停止匹配任务（通过取消数据库后端查询）；
+                 暂停/恢复功能仅在单阶段匹配模式生效，两阶段模式未实现
 
 技术要点：
     - 使用 PostgreSQL + pgvector 进行向量召回
     - 使用 MGeo 模型进行精排匹配
     - 支持任务状态监控和进度回调
+    - 两阶段流程：阶段1粗召回（占进度40%）→ 阶段2精排（占进度60%）
 """
 
 import time
@@ -39,18 +41,19 @@ class AddressMatcher:
         vector_store: 向量存储管理器
         embedder: 地址向量化器
         ranking_engine: 精排引擎
-        threshold: 相似度阈值
-        mode: 匹配模式 ('two_stage' 或其他)
+        threshold: 相似度阈值（用于粗召回阶段过滤候选）
+        mode: 匹配模式，默认 'two_stage'（两阶段匹配：粗召回+MGeo精排）
         is_running: 是否正在运行
-        is_paused: 是否暂停
+        is_paused: 是否暂停（仅在单阶段匹配模式生效，两阶段模式未实现）
         processed_count: 已处理数量
         total_count: 总数量
-        current_stage: 当前阶段
-        progress: 进度(0-1)
+        current_stage: 当前阶段（如 'Stage 1: 粗召回' / 'Stage 2: MGeo精排'）
+        progress: 进度(0-1)，粗召回完成后固定为0.4，精排完成后为1.0
         speed: 处理速度(条/秒)
         remaining_time: 预计剩余时间(秒)
+        status_message: 状态消息
         error_message: 错误信息
-        matching_thread: 匹配线程
+        matching_thread: 匹配后台线程
     """
     
     def __init__(self, db_connection, device=None, mode='two_stage'):
@@ -452,19 +455,38 @@ class AddressMatcher:
         return processed_count
     
     def pause(self):
-        """暂停匹配任务"""
+        """
+        暂停匹配任务
+
+        仅对单阶段匹配模式（mode != 'two_stage'）有效，
+        两阶段模式（two_stage）中未实现暂停逻辑。
+        """
         self.is_paused = True
         logger.info("Matching paused")
-    
+
     def resume(self):
-        """恢复匹配任务"""
+        """
+        恢复匹配任务
+
+        仅对单阶段匹配模式（mode != 'two_stage'）有效，
+        两阶段模式（two_stage）中未实现恢复逻辑。
+        """
         self.is_paused = False
         logger.info("Matching resumed")
-    
+
     def stop(self):
-        """停止匹配任务"""
+        """
+        停止匹配任务
+
+        设置 is_running=False 终止主循环，同时取消数据库后端正在执行的查询，
+        避免后台 SQL 查询继续占用资源。
+        """
         self.is_running = False
         self.is_paused = False
+        try:
+            self.db.cancel_current_query()
+        except Exception as e:
+            logger.warning(f"取消数据库查询时出错: {e}")
         logger.info("Matching stopped")
     
     def start_async(self, enterprise_table, enterprise_id_col, enterprise_name_col, 
@@ -541,11 +563,25 @@ class AddressMatcher:
                     similarity_threshold=self.threshold
                 )
 
+                # 检查是否在 batch_recall 期间被取消
+                if not self.is_running:
+                    logger.info("粗召回已被用户取消，丢弃结果")
+                    self.current_stage = '已取消'
+                    self.status_message = '粗召回已取消'
+                    return
+
                 recall_count = len(recall_results)
                 candidate_count = sum(len(item['candidates']) for item in recall_results)
 
                 # 保存召回结果到数据库
                 inserted = self.data_loader.insert_recall_results(recall_results, recall_table)
+
+                # 再次检查，避免在保存结果后被取消时仍触发回调
+                if not self.is_running:
+                    logger.info("粗召回已被用户取消（保存后）")
+                    self.current_stage = '已取消'
+                    self.status_message = '粗召回已取消'
+                    return
 
                 stage1_time = time.time() - stage1_start
 
@@ -630,10 +666,23 @@ class AddressMatcher:
 
                 # 使用优化的批量精排方法（一次性批量预测所有候选）
                 final_results = self.ranking_engine.batch_rank_optimized(recall_results, similarity_threshold=self.threshold)
+
+                # 检查是否被取消
+                if not self.is_running:
+                    logger.info("精排已被用户取消，丢弃结果")
+                    self.current_stage = '已取消'
+                    self.status_message = '精排已取消'
+                    return
+
                 match_count = len(final_results)
 
                 # 批量写入数据库（每1000条）
                 for i in range(0, len(final_results), 1000):
+                    if not self.is_running:
+                        logger.info("精排写入过程中被取消")
+                        self.current_stage = '已取消'
+                        self.status_message = '精排已取消'
+                        return
                     batch = final_results[i:i+1000]
                     inserted = self.data_loader.insert_match_results(batch, result_table)
 

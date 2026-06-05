@@ -15,11 +15,12 @@
     3. 支持批量向量化处理
 
 技术要点：
-    1. 优先使用 modelscope 加载模型（ModelScope 模型原生支持）
-    2. 回退使用 transformers 加载模型（需 trust_remote_code=True）
-    3. 取 last_hidden_state 的 [CLS] token 作为句向量
-    4. 必须进行 L2 归一化（pgvector 余弦距离计算依赖归一化向量）
-    5. 多路径搜索：项目目录 > modelscope缓存 > huggingface缓存 > 在线下载
+    1. 优先使用 modelscope 从本地路径加载模型（ModelScope 模型原生支持）
+    2. 回退使用 transformers 从本地路径加载模型（需 trust_remote_code=True）
+    3. 本地加载失败时，尝试从模型名称在线下载
+    4. 取 last_hidden_state 的第一个 token（[CLS]）作为句向量
+    5. 必须进行 L2 归一化（pgvector 余弦距离计算依赖归一化向量）
+    6. 多路径搜索：项目目录 > modelscope缓存 > huggingface缓存 > 在线下载
 """
 
 import torch
@@ -134,6 +135,12 @@ class AddressEmbedder:
                 if hasattr(module, 'dropout'):
                     module.dropout.p = 0
 
+            if self.device == 'cuda':
+                self.model.half()
+                logger.info("已启用 FP16 半精度推理（GPU 模式）")
+
+            self.use_fp16 = (self.device == 'cuda')
+
             test_input = self.tokenizer("测试地址", return_tensors='pt').to(self.device)
             with torch.no_grad():
                 test_output = self.model(**test_input)
@@ -213,23 +220,25 @@ class AddressEmbedder:
 
         return False
     
-    def encode(self, texts, batch_size=64, max_len=64):
+    def encode(self, texts, batch_size=None, max_len=64):
         """
         将文本列表转换为向量列表
         
         MGeo 官方标准句向量生成流程：
         1. 使用 tokenizer 对文本进行编码
         2. 取 last_hidden_state 的第一个 token ([CLS])
-        3. 进行 L2 归一化（pgvector cosine 距离计算依赖此步骤）
+        3. 进行 L2 归一化（pgvector cosine 距离计算依赖归一化向量）
         
         Args:
             texts: 文本列表
-            batch_size: 批处理大小
+            batch_size: 批处理大小，None 时根据设备自动选择（GPU=256，CPU=128）
             max_len: 最大文本长度
         
         Returns:
             numpy数组，形状为 (len(texts), vector_dim)
         """
+        if batch_size is None:
+            batch_size = 256 if self.device == 'cuda' else 128
         embeddings = []
         
         for i in range(0, len(texts), batch_size):
@@ -245,9 +254,14 @@ class AddressEmbedder:
                     return_tensors="pt"
                 ).to(self.device)
 
+                if self.use_fp16:
+                    inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
+
                 with torch.no_grad():
                     outputs = self.model(**inputs)
-                    cls_emb = outputs.last_hidden_state[:, 0, :]  
+                    cls_emb = outputs.last_hidden_state[:, 0, :]
+                    if cls_emb.dtype == torch.float16:
+                        cls_emb = cls_emb.float()
                     norm_emb = torch.nn.functional.normalize(cls_emb, p=2, dim=1)  
 
                 embeddings.append(norm_emb.cpu().numpy())

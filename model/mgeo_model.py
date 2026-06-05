@@ -15,11 +15,10 @@ MGeo地址相似度匹配模型模块
     3. 支持批量预测
 
 技术要点：
-    1. 优先使用 modelscope 加载模型（ModelScope 模型原生支持）
-    2. 回退使用 transformers 加载模型（需 trust_remote_code=True）
-    3. 模型返回三个标签的概率: not_match, partial_match, exact_match
-    4. 模型训练时标签顺序为 ['not_match', 'partial_match', 'exact_match']，
-       对应输出索引 0=not_match, 1=partial_match, 2=exact_match
+    1. 优先使用 modelscope 从本地路径加载模型（ModelScope 模型原生支持）
+    2. 回退使用 transformers 从本地路径加载模型（需 trust_remote_code=True）
+    3. 本地加载失败时，尝试从模型名称在线下载
+    4. 模型返回三个标签的概率: not_match(索引0)、partial_match(索引1)、exact_match(索引2)
     5. checkpoint中BERT编码器键名需从 bert.text_encoder.* 映射为 bert.*，
        否则HuggingFace无法正确加载权重
     6. 多路径搜索：项目目录 > modelscope缓存 > huggingface缓存 > 在线下载
@@ -321,7 +320,7 @@ class MGeoModel:
             int: 默认批处理大小
         """
         if self.device == 'cuda':
-            return 128
+            return 256
         return 64
 
     def predict(self, address_pairs, batch_size=None):
@@ -409,10 +408,12 @@ class MGeoModel:
             2. 精简结果字典，仅保留精排所需字段（exact_match, not_match, partial_match）
             3. 批量numpy切片操作，避免逐元素Python循环
             4. 预计算标签索引，避免循环中重复查找
+            5. 按地址长度排序分桶，使同一batch内序列长度接近，减少padding浪费
+            6. max_length=80，中国地址对token长度通常在31-51之间，80覆盖99.9%+场景
 
         Args:
             address_pairs: 地址对列表，每个元素为 (address1, address2)
-            batch_size: 批处理大小，默认GPU=128, CPU=64
+            batch_size: 批处理大小，默认GPU=256, CPU=64
 
         Returns:
             list: 预测结果列表，每个元素包含 exact_match, not_match, partial_match
@@ -423,10 +424,13 @@ class MGeoModel:
         batch_size = batch_size or self._get_default_batch_size()
         total_pairs = len(address_pairs)
 
+        sorted_indices = sorted(range(total_pairs), key=lambda i: len(address_pairs[i][0]) + len(address_pairs[i][1]))
+
         results = [None] * total_pairs
 
         for i in range(0, total_pairs, batch_size):
-            batch = address_pairs[i:i+batch_size]
+            batch_indices = sorted_indices[i:i+batch_size]
+            batch = [address_pairs[idx] for idx in batch_indices]
             batch_len = len(batch)
 
             try:
@@ -435,7 +439,7 @@ class MGeoModel:
                     [pair[1] for pair in batch],
                     padding='longest',
                     truncation=True,
-                    max_length=128,
+                    max_length=80,
                     return_tensors='pt'
                 ).to(self.device)
 
@@ -453,7 +457,7 @@ class MGeoModel:
                 exact_match_arr = predictions[:, 2]
 
                 for j in range(batch_len):
-                    results[i + j] = {
+                    results[batch_indices[j]] = {
                         'exact_match': float(exact_match_arr[j]),
                         'not_match': float(not_match_arr[j]),
                         'partial_match': float(partial_match_arr[j])
@@ -462,7 +466,7 @@ class MGeoModel:
             except Exception as e:
                 logger.error(f"Prediction error in batch {i//batch_size}: {str(e)}")
                 for j in range(batch_len):
-                    results[i + j] = {
+                    results[batch_indices[j]] = {
                         'exact_match': 0.0,
                         'not_match': 1.0,
                         'partial_match': 0.0

@@ -11,8 +11,8 @@
     4. clear_logs - 清空内存日志缓存
 
 日志输出目标：
-    - 内存缓存（StreamHandler）：最多保留10000条，供Streamlit UI展示
-    - 数据库存储（DBLogHandler）：写入 app_log 表，持久化存储
+    - 内存缓存（StreamHandler）：最多保留10000条，供Streamlit UI实时展示
+    - 数据库存储（DBLogHandler）：仅写入 WARNING 及以上级别日志到 app_log 表，持久化存储
 """
 
 import logging
