@@ -7,60 +7,100 @@ import os
 import socket
 import atexit
 import signal
+import ctypes
 
-# 全局变量保存子进程引用，供 atexit 清理
 _proc = None
+_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit_pid")
+
+
+def _write_pid(pid):
+    try:
+        with open(_PID_FILE, "w") as f:
+            f.write(str(pid))
+    except Exception:
+        pass
+
+
+def _read_pid():
+    try:
+        with open(_PID_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _force_kill(pid):
+    """直接用 Win32 TerminateProcess，不依赖外部 taskkill 命令"""
+    try:
+        if sys.platform == "win32":
+            # 对 pid=0 的无效值做保护
+            if not pid or pid <= 0:
+                return
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # 打开进程句柄
+            PROCESS_TERMINATE = 0x0001
+            h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h:
+                ctypes.windll.kernel32.TerminateProcess(h, 0)
+                ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
 
 
 def _cleanup_proc():
-    """退出时强制结束 Streamlit 子进程及其子进程树"""
+    """退出时强制结束 Streamlit 子进程"""
     global _proc
     if _proc and _proc.poll() is None:
+        pid = _proc.pid
         try:
+            # Win32 直接用 TerminateProcess，不依赖 taskkill
+            _force_kill(pid)
+            # 也尝试杀掉整棵进程树
             if sys.platform == "win32":
-                # 杀掉整个进程树，确保所有子进程都被终止
                 subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(_proc.pid)],
-                    capture_output=True,
-                    timeout=10,
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=5,
                 )
-            else:
-                _proc.terminate()
-                try:
-                    _proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    _proc.kill()
-                    _proc.wait(timeout=5)
         except Exception:
             pass
+    # 删除 PID 文件
+    try:
+        os.remove(_PID_FILE)
+    except Exception:
+        pass
 
 
 def kill_port_process(port=8501):
-    """杀掉占用指定端口的进程"""
+    """杀掉占用指定端口的残留进程"""
+    # 先尝试从 PID 文件读取
+    old_pid = _read_pid()
+    if old_pid and old_pid > 0:
+        print(f"[清理] 发现上次残留的 PID: {old_pid}")
+        _force_kill(old_pid)
+        time.sleep(0.5)
+
+    # 再查端口兜底
     if sys.platform != "win32":
         return
     try:
-        # 查找占用端口的 PID
         result = subprocess.run(
-            ["netstat", "-ano"],
-            capture_output=True, text=True, timeout=10,
+            ["netstat", "-ano"], capture_output=True, text=True, timeout=10
         )
         for line in result.stdout.splitlines():
             if f":{port}" in line and "LISTENING" in line:
-                parts = line.strip().split()
-                pid = parts[-1]
+                pid = line.strip().split()[-1]
+                if old_pid and str(old_pid) == pid:
+                    continue  # 已经处理过
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", pid],
                     capture_output=True, timeout=10,
                 )
-                time.sleep(1)
-                print(f"[清理] 已结束占用端口 {port} 的旧进程 (PID {pid})")
+                print(f"[清理] 已结束占用端口 {port} 的残留进程 (PID {pid})")
     except Exception:
         pass
 
 
 def wait_for_port(host="localhost", port=8501, timeout=30):
-    """等待端口就绪"""
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -75,11 +115,16 @@ def main():
     global _proc
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    # 注册退出清理函数
+    # atexit 清理
     atexit.register(_cleanup_proc)
-    # 注册信号处理（Ctrl+C）
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    # Ctrl+C / Ctrl+Break 处理
+    def _on_exit(*_):
+        _cleanup_proc()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _on_exit)
+    signal.signal(signal.SIGTERM, _on_exit)
 
     print("=" * 40)
     print("   地址匹配系统 - 正在启动")
@@ -87,7 +132,7 @@ def main():
     print(f"项目目录: {os.getcwd()}")
     print()
 
-    # 先杀掉可能残留的旧进程
+    # 启动前清理残留
     print("[0/3] 清理残留进程...")
     kill_port_process(8501)
 
@@ -95,6 +140,7 @@ def main():
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     _proc = subprocess.Popen(
         [sys.executable, "-m", "streamlit", "run", "app.py", "--server.headless", "true"],
         stdout=subprocess.PIPE,
@@ -102,21 +148,13 @@ def main():
         text=True,
         **kwargs,
     )
+    _write_pid(_proc.pid)
     print(f"   Streamlit PID: {_proc.pid}")
 
     print("[2/3] 等待服务就绪...")
     if not wait_for_port():
         print()
-        print("服务启动超时！以下为 Streamlit 输出：")
-        print("-" * 40)
-        for _ in range(20):
-            line = _proc.stdout.readline()
-            if not line:
-                break
-            print(line, end="")
-        print("-" * 40)
-        print()
-        input("按回车键退出...")
+        print("服务启动超时！")
         _cleanup_proc()
         sys.exit(1)
 
