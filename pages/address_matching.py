@@ -48,39 +48,16 @@ def reset_matching_status():
     }
 
 
-def _render_js_timer(start_time: float):
+def _render_elapsed_time(start_time: float):
     """
-    渲染前端 JS 秒表。
+    渲染已运行时间。
 
-    使用 st.html 内联 HTML（非 iframe），JS 在主页面上下文执行，
-    不随 fragment 刷新重置，秒表持续运行不断裂。
+    Streamlit 的 st.html 不支持 JS 执行（DOMPurify 会剥离 script 标签），
+    st.components.v1.html 在 fragment 内有 key 注入冲突。
+    因此直接使用 Python 计算已运行时间，fragment 每 3 秒刷新时自动更新。
     """
-    html_str = (
-        '<div style="font-family:inherit;font-size:1rem;color:inherit;background:transparent;padding:0;margin:0;line-height:1.6;">'
-        '<span id="matching-elapsed-timer">0.0 秒</span>'
-        '</div>'
-        '<script>'
-        '(function(){'
-        f'var startTime={start_time};'
-        'var el=document.getElementById("matching-elapsed-timer");'
-        'if(!el)return;'
-        'var fmt=function(s){'
-        'if(s<60)return s.toFixed(1)+" 秒";'
-        'var m=Math.floor(s/60),sec=Math.floor(s%60);'
-        'if(s<3600)return m+" 分 "+sec+" 秒";'
-        'var h=Math.floor(s/3600),rem=Math.floor((s%3600)/60);'
-        'return h+" 小时 "+rem+" 分";'
-        '};'
-        'var tick=function(){'
-        'var elapsed=Math.max(0,(Date.now()/1000)-startTime);'
-        'el.textContent=fmt(elapsed);'
-        '};'
-        'tick();'
-        'setInterval(tick,1000);'
-        '})();'
-        '</script>'
-    )
-    st.html(html_str)
+    elapsed = max(0, time.time() - start_time)
+    st.write(f"**已运行时间**: {format_time(elapsed)}")
 
 
 POLL_INTERVAL = 3  # 秒
@@ -155,13 +132,7 @@ def _render_status_card(matching_status):
             time.localtime(matching_status['start_time'])
         )
         st.write(f"**开始时间**: {start_time_str}")
-
-        # 已运行时间：标签原生 + JS iframe 数值
-        label_col, value_col = st.columns([1, 4])
-        with label_col:
-            st.write("**已运行时间**:")
-        with value_col:
-            _render_js_timer(matching_status['start_time'])
+        _render_elapsed_time(matching_status['start_time'])
 
     st.write(f"**当前阶段**: {matching_status['current_stage']}")
 
