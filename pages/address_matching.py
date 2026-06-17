@@ -5,7 +5,6 @@
 """
 
 import streamlit as st
-from streamlit.components.v1 import html as st_html
 import time
 import threading
 import pandas as pd
@@ -53,49 +52,35 @@ def _render_js_timer(start_time: float):
     """
     渲染前端 JS 秒表。
 
-    使用 st.components.v1.html iframe 嵌入 JS 定时器，每秒更新已运行时间。
-    注意：Streamlit 1.38 的 st_html 不支持 key 参数；fragment 刷新时 iframe
-    会重新加载，但加载后立即根据 start_time 显示正确的已运行时间。
+    使用 st.html 内联 HTML（非 iframe），JS 在主页面上下文执行，
+    不随 fragment 刷新重置，秒表持续运行不断裂。
     """
-    html = f"""
-    <div id="timer-root" style="
-        font-family: inherit;
-        font-size: 1rem;
-        color: inherit;
-        background: transparent;
-        padding: 0;
-        margin: 0;
-        line-height: 1.6;
-    ">
-      <span id="elapsed">0.0 秒</span>
-    </div>
-    <script>
-      (function() {{
-        const startTime = {start_time};
-        const el = document.getElementById('elapsed');
-        if (!el) return;
-
-        const fmt = function(s) {{
-          if (s < 60) return s.toFixed(1) + ' 秒';
-          const m = Math.floor(s / 60);
-          const sec = Math.floor(s % 60);
-          if (s < 3600) return m + ' 分 ' + sec + ' 秒';
-          const h = Math.floor(s / 3600);
-          const rem = Math.floor((s % 3600) / 60);
-          return h + ' 小时 ' + rem + ' 分';
-        }};
-
-        const tick = function() {{
-          const elapsed = Math.max(0, (Date.now() / 1000) - startTime);
-          el.textContent = fmt(elapsed);
-        }};
-
-        tick();
-        setInterval(tick, 1000);
-      }})();
-    </script>
-    """
-    st_html(html, height=25)
+    html_str = (
+        '<div style="font-family:inherit;font-size:1rem;color:inherit;background:transparent;padding:0;margin:0;line-height:1.6;">'
+        '<span id="matching-elapsed-timer">0.0 秒</span>'
+        '</div>'
+        '<script>'
+        '(function(){'
+        f'var startTime={start_time};'
+        'var el=document.getElementById("matching-elapsed-timer");'
+        'if(!el)return;'
+        'var fmt=function(s){'
+        'if(s<60)return s.toFixed(1)+" 秒";'
+        'var m=Math.floor(s/60),sec=Math.floor(s%60);'
+        'if(s<3600)return m+" 分 "+sec+" 秒";'
+        'var h=Math.floor(s/3600),rem=Math.floor((s%3600)/60);'
+        'return h+" 小时 "+rem+" 分";'
+        '};'
+        'var tick=function(){'
+        'var elapsed=Math.max(0,(Date.now()/1000)-startTime);'
+        'el.textContent=fmt(elapsed);'
+        '};'
+        'tick();'
+        'setInterval(tick,1000);'
+        '})();'
+        '</script>'
+    )
+    st.html(html_str)
 
 
 POLL_INTERVAL = 3  # 秒
