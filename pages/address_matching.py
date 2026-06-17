@@ -303,62 +303,12 @@ def start_recall_matching(db_config, device, enterprise_vector_table, standard_v
             'candidate_count': 0
         })
 
-        # 在主线程中预先读取好 start_time，避免后台线程回调里访问 st.session_state
-        matching_start_time = st.session_state.matching_status['start_time']
-
-        # 定义完成回调函数：在粗召回完成后主动更新状态
-        def on_recall_completed(recall_results):
-            """粗召回完成回调函数（在后台线程中执行，不能直接访问 st.session_state）"""
-            recall_count = len(recall_results)
-            candidate_count = sum(len(item['candidates']) for item in recall_results)
-
-            logger.info(f"[回调] 粗召回完成，企业数: {recall_count}, 候选数: {candidate_count}")
-
-            # 构造新的状态字典，使用预先保存的 start_time
-            new_matching_status = {
-                'is_running': False,
-                'processed_count': recall_count,
-                'current_stage': '数据粗召回完成',
-                'progress': 1.0,
-                'speed': 0.0,
-                'remaining_time': 0.0,
-                'status_message': '粗召回完成',
-                'error_message': '',
-                'start_time': matching_start_time,
-                'recall_completed': True,
-                'ranking_completed': False,
-                'ranking_ui_shown': False,
-                'recall_count': recall_count,
-                'match_count': 0
-            }
-
-            new_recall_status = {
-                'completed': True,
-                'end_time': time.time(),
-                'recall_count': recall_count,
-                'candidate_count': candidate_count,
-                'start_time': matching_start_time
-            }
-
-            # 通过线程安全的方式更新共享对象（如果存在）
-            try:
-                if 'matcher' in st.session_state and st.session_state.matcher:
-                    st.session_state.matcher.is_running = False
-                    st.session_state.matcher.processed_count = recall_count
-                    st.session_state.matcher.progress = 1.0
-                    st.session_state.matcher.current_stage = '数据粗召回完成'
-                    st.session_state.matcher.status_message = '粗召回完成'
-            except Exception as e:
-                logger.warning(f"[回调] 更新 matcher 状态失败: {e}")
-
-            # 设置触发器，让主线程知道粗召回已完成
-            # 在后台线程中不能直接调用 st.rerun()，只能设置标志让主线程刷新
-            # 使用一个队列/对象传递新状态，避免在后台线程读写 st.session_state
-            st.session_state['recall_finished_trigger'] = {
-                'matching_status': new_matching_status,
-                'recall_status': new_recall_status
-            }
-            logger.info("[回调] 已设置 recall_finished_trigger 标志")
+        # 注：不在后台线程中通过 callback 访问 st.session_state，
+        # 因为后台线程没有 ScriptRunContext，无法读写 st.session_state。
+        # 改为依赖 matcher 对象的 is_running 标志（finally 块中自动置 False）
+        # + fragment 每 3 秒轮询 matcher.get_status()
+        # + show_address_matching 中的 DB 兜底检测
+        pass
 
         # 启动后台任务，使用回调函数通知完成状态
         matcher.start_recall_async(
@@ -366,7 +316,7 @@ def start_recall_matching(db_config, device, enterprise_vector_table, standard_v
             standard_table=standard_vector_table,
             top_n=st.session_state.matching_config['recall_top_n'],
             progress_callback=None,
-            completed_callback=on_recall_completed,
+            completed_callback=None,
             recall_table=st.session_state.current_recall_table
         )
 
