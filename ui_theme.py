@@ -371,6 +371,10 @@ def inject_global_styles():
         border-radius: {Radius.FULL} !important;
     }}
 
+    .stProgress > div > div > div {{
+        transition: width 0.5s ease-out !important;
+    }}
+
     /* ===== 标签页优化 ===== */
     .stTabs [data-baseweb="tab-list"] {{
         gap: 4px;
