@@ -49,13 +49,13 @@ def reset_matching_status():
     }
 
 
-def _render_js_timer(start_time: float, key: str = "matching_elapsed_timer"):
+def _render_js_timer(start_time: float):
     """
     渲染前端 JS 秒表。
 
-    使用固定 key，HTML 内容只依赖 start_time。
-    在 fragment 每 3 秒刷新时，只要 start_time 不变，iframe 不会重新加载，
-    JS 定时器持续运行，秒表不会重置。
+    使用 st.components.v1.html iframe 嵌入 JS 定时器，每秒更新已运行时间。
+    注意：Streamlit 1.38 的 st_html 不支持 key 参数；fragment 刷新时 iframe
+    会重新加载，但加载后立即根据 start_time 显示正确的已运行时间。
     """
     html = f"""
     <div id="timer-root" style="
@@ -95,7 +95,7 @@ def _render_js_timer(start_time: float, key: str = "matching_elapsed_timer"):
       }})();
     </script>
     """
-    st_html(html, height=25, key=key)
+    st_html(html, height=25)
 
 
 POLL_INTERVAL = 3  # 秒
