@@ -144,7 +144,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ### 4. 准备数据库
 
 ```sql
-CREATE DATABASE prj_sj_db;
+CREATE DATABASE your_db;
 \c prj_sj_db
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE SCHEMA IF NOT EXISTS ai;
@@ -157,10 +157,10 @@ CREATE SCHEMA IF NOT EXISTS ai;
 ```env
 DB_HOST=localhost
 DB_PORT=5432
-DB_NAME=prj_sj_db
-DB_USER=sj
+DB_NAME=
+DB_USER=
 DB_PASSWORD=your_password_here
-DB_SCHEMA=ai
+DB_SCHEMA=
 ```
 
 ### 6. 启动
@@ -257,7 +257,7 @@ pytest tests/test_vector_store_rename.py::TestVectorStoreRename::test_rename   #
 
 ## 注意事项
 
-- 数据库连接参数可通过 `.env` 管理，**请勿将 `.env` 提交至仓库**
+- 数据库连接参数可通过 `.env` 管理
 - 模型权重（`models/`）、虚拟环境（`venv/`）已在 `.gitignore` 中排除，需各自本地准备
 - 默认相似度阈值 `0.8`、召回数量 `50`，可在 `config.py` 或界面中调整
 - 无 GPU 时自动以 CPU 模式运行，界面上方会显示当前运行设备
