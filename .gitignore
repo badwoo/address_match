@@ -35,10 +35,14 @@ dist/
 build/
 *.egg
 
+# --- Packed archives (models.zip ~1.8GB, address_match.zip) ---
+*.zip
+
 # --- Logs ---
 *.log
 logs/
 app.log
+.streamlit_pid
 
 # --- IDE / tooling ---
 .idea/

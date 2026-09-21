@@ -9,7 +9,7 @@
     2. 批量地址匹配 - 对多个查询地址进行批量精排
 
 匹配逻辑：
-    - MGeo模型返回三个概率: not_match(索引0)、partial_match(索引1)、exact_match(索引2)
+    - MGeo模型返回三个概率: exact_match(索引0)、not_match(索引1)、partial_match(索引2)
     - 候选排序：四舍五入保留两位小数后比较，优先 exact_match 最高 → partial_match 最高 → not_match 最低
     - match_status 判断: exact_match、partial_match、not_match 三者中数值最大的决定状态
       - exact_match 最大 → '精确匹配'
@@ -21,6 +21,7 @@
 from config import Config
 from model.mgeo_model import MGeoModel
 from utils.logger import logger
+from matching.utils import determine_match_status as _unified_determine_match_status
 
 
 def determine_match_status(exact_match_score, partial_match_score, not_match_score=None):
@@ -33,6 +34,12 @@ def determine_match_status(exact_match_score, partial_match_score, not_match_sco
         - partial_match 最大 → '部分匹配'
         - not_match 最大 → '不匹配'
 
+    实现说明：
+        本函数为 matching.utils.determine_match_status 的薄封装，保持 ranking.py
+        原行为（不四舍五入，直接比较原始概率）。统一逻辑见 matching.utils。
+        保留本函数签名以兼容 matcher.py 的 `from matching.ranking import
+        determine_match_status` 导入。
+
     Args:
         exact_match_score: 精确匹配概率
         partial_match_score: 部分匹配概率
@@ -41,37 +48,35 @@ def determine_match_status(exact_match_score, partial_match_score, not_match_sco
     Returns:
         str: 匹配状态（精确匹配/部分匹配/不匹配）
     """
-    if not_match_score is None:
-        not_match_score = 0.0
-
-    scores = {
-        '精确匹配': exact_match_score,
-        '部分匹配': partial_match_score,
-        '不匹配': not_match_score
-    }
-    return max(scores, key=scores.get)
+    return _unified_determine_match_status(
+        exact_match_score, partial_match_score, not_match_score, round_scores=False
+    )
 
 
 class RankingEngine:
     """
     精排引擎
-    
+
     使用MGeo模型对召回的候选地址进行精准排序。
-    
+
     Attributes:
         model: MGeoModel 对象
         threshold: 相似度阈值
     """
-    
-    def __init__(self, device=None):
+
+    def __init__(self, device=None, model=None):
         """
         初始化精排引擎
-        
+
         Args:
             device: 运行设备 ('cuda' 或 'cpu')
+            model: 外部传入的 MGeoModel 实例（可选，传入时跳过模型加载，避免重复加载占内存）
         """
-        device = device or Config.DEVICE
-        self.model = MGeoModel(device=device)
+        if model is not None:
+            self.model = model
+        else:
+            device = device or Config.DEVICE
+            self.model = MGeoModel(device=device)
         self.threshold = Config.SIMILARITY_THRESHOLD
     
     def rank(self, query_address, candidates):
@@ -167,30 +172,40 @@ class RankingEngine:
         
         return results
     
-    def batch_rank_optimized(self, recall_results, batch_size=1000, similarity_threshold=None, chunk_size=5000):
+    def batch_rank_optimized(self, recall_results, batch_size=1000, similarity_threshold=None,
+                             chunk_size=5000, progress_callback=None, cancel_check=None):
         """
         优化的批量精排方法（用于两阶段匹配流程）
-        
+
         分块处理企业的候选地址，避免一次性加载所有地址对导致OOM。
         每处理 chunk_size 个企业的地址对后，立即送入模型预测并释放内存，
         然后再处理下一批企业。
-        
+
         Args:
             recall_results: 召回结果列表，每个元素包含 enterprise_id, enterprise_address, candidates
             batch_size: 批次大小，控制每次预测的地址对数量
             similarity_threshold: 相似度阈值（0-1），候选地址的向量相似度低于此阈值将被过滤，None表示不过滤
             chunk_size: 每次处理的企业数量，控制内存占用上限。
                         例如 chunk_size=5000, 每个企业50个候选 = 25万对，远小于全部加载的7500万对
-        
+            progress_callback: 进度回调函数（可选），每完成一个 chunk 后调用，接收 dict 参数：
+                               {'processed': int, 'total': int, 'progress': float}
+            cancel_check: 取消检查函数（可选），每个 chunk 开始前调用，返回 True 表示已取消。
+                          取消后返回已完成部分的结果，未处理部分保持 None。
+
         Returns:
-            list: 匹配结果列表
+            list: 匹配结果列表（取消时可能包含 None 占位）
         """
         threshold = similarity_threshold if similarity_threshold is not None else self.threshold
         total = len(recall_results)
-        
+
         final_results = [None] * total
-        
+
         for chunk_start in range(0, total, chunk_size):
+            # 每个 chunk 开始前检查是否被取消
+            if cancel_check and cancel_check():
+                logger.info("精排被取消，已处理 %d/%d 企业", chunk_start, total)
+                return final_results
+
             chunk_end = min(chunk_start + chunk_size, total)
             chunk_items = recall_results[chunk_start:chunk_end]
             
@@ -304,5 +319,13 @@ class RankingEngine:
                 }
             
             logger.info(f"精排进度: {chunk_end}/{total} 企业已完成 (本块 {len(chunk_pairs)} 对地址)")
-        
+
+            # 进度回调通知调用方
+            if progress_callback:
+                progress_callback({
+                    'processed': chunk_end,
+                    'total': total,
+                    'progress': chunk_end / total if total > 0 else 1.0
+                })
+
         return final_results

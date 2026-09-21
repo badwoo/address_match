@@ -27,6 +27,13 @@ import os
 import subprocess
 import torch
 
+# 加载 .env 文件中的环境变量（如果存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 def _detect_gpu_info():
     """
@@ -141,12 +148,12 @@ def _find_model_local_path(model_name):
 
 class Config:
     # ==================== 数据库配置 ====================
-    DB_HOST = 'localhost'
-    DB_PORT = 5432
-    DB_NAME = 'postgres'
-    DB_USER = 'postgres'
-    DB_PASSWORD = '123456'
-    DB_SCHEMA = 'public'  # 数据库模式（schema），默认为public
+    DB_HOST = os.getenv('DB_HOST', 'localhost')
+    DB_PORT = int(os.getenv('DB_PORT', '5432'))
+    DB_NAME = os.getenv('DB_NAME', 'prj_sj_db')
+    DB_USER = os.getenv('DB_USER', 'sj')
+    DB_PASSWORD = os.getenv('DB_PASSWORD', '123456')
+    DB_SCHEMA = os.getenv('DB_SCHEMA', 'ai')  # 数据库模式（schema），默认为public
     
     # ==================== 模型配置 ====================
     # 向量化模型（粗召回阶段使用）
@@ -189,3 +196,30 @@ class Config:
     
     # ==================== 日志配置 ====================
     LOG_LEVEL = 'WARNING'  # 精简日志，默认只记录 WARNING 及以上
+
+
+class RuntimeConfig:
+    """
+    运行时参数配置
+
+    集中管理各模块中分散的运行时参数（如轮询间隔、chunk 大小、缓存上限），
+    避免硬编码常量散落各处，便于统一调优。
+    """
+
+    # ==================== Fragment 轮询间隔（秒） ====================
+    FRAGMENT_POLL_INTERVAL = 3
+
+    # ==================== 流式处理参数 ====================
+    STREAMING_CHUNK_SIZE = 5000       # 流式召回每批的企业数量
+    STREAMING_BATCH_ENTERPRISE = 1000  # 流式管线每批处理的企业数（控制内存）
+
+    # ==================== 模型缓存 ====================
+    MAX_MODEL_CACHE = 2  # 模型实例缓存上限（LRU 淘汰）
+
+    # ==================== 流式管线触发阈值 ====================
+    # 企业数 >= 此值时自动使用流式管线，否则使用全量管线
+    STREAMING_THRESHOLD = 100000
+
+    # ==================== 精排参数 ====================
+    RANKING_CHUNK_SIZE = 5000  # 精排每 chunk 处理的企业数
+    RANKING_BATCH_SIZE = 1000  # 精排模型预测批次大小

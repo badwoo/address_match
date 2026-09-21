@@ -18,6 +18,7 @@
     - 使用 psycopg2.extras.execute_values 进行高效批量插入
 """
 
+import time
 import pandas as pd
 import psycopg2
 from config import Config
@@ -37,11 +38,154 @@ class DataLoader:
     def __init__(self, db_connection):
         """
         初始化数据加载器
-        
+
         Args:
             db_connection: DBConnection 对象
         """
         self.db = db_connection
+
+    # ==================== 通用方法（减少重复代码） ====================
+
+    def _generic_truncate_table(self, table_name, log_label=''):
+        """
+        通用清空表
+
+        Args:
+            table_name: 表名
+            log_label: 日志标签，用于标识表类型
+
+        Returns:
+            bool: 清空成功返回 True
+        """
+        sql = f"TRUNCATE TABLE {quote_identifier(table_name)}"
+        cursor = self.db.execute(sql)
+        if cursor:
+            self.db.commit()
+            logger.info(f"{log_label}{table_name} 已清空")
+            return True
+        return False
+
+    def _generic_get_count(self, table_name, filters=None, filter_builder=None):
+        """
+        通用计数查询
+
+        Args:
+            table_name: 表名
+            filters: 过滤条件字典
+            filter_builder: 筛选条件构建函数，签名为 (filters) -> (conditions, params)
+
+        Returns:
+            int: 记录总数
+        """
+        sql = f"SELECT COUNT(*) as count FROM {quote_identifier(table_name)}"
+        params = None
+
+        if filters and filter_builder:
+            conditions, params = filter_builder(filters)
+            if conditions:
+                sql += " WHERE " + " AND ".join(conditions)
+
+        try:
+            cursor = self.db.execute(sql, params)
+            if cursor:
+                result = cursor.fetchone()
+                return result['count'] if result else 0
+        except Exception as e:
+            logger.error(f"获取记录总数失败: {str(e)}")
+        return 0
+
+    def _generic_get_paginated(self, table_name, filters=None, filter_builder=None,
+                                page=1, page_size=20, order_by='id'):
+        """
+        通用分页查询
+
+        Args:
+            table_name: 表名
+            filters: 过滤条件字典
+            filter_builder: 筛选条件构建函数，签名为 (filters) -> (conditions, params)
+            page: 页码（从1开始）
+            page_size: 每页记录数
+            order_by: 排序子句
+
+        Returns:
+            DataFrame: 查询结果数据帧
+        """
+        sql = f"SELECT * FROM {quote_identifier(table_name)}"
+        params = []
+
+        if filters and filter_builder:
+            conditions, params = filter_builder(filters)
+            if conditions:
+                sql += " WHERE " + " AND ".join(conditions)
+
+        sql += f" ORDER BY {order_by}"
+
+        offset = (page - 1) * page_size
+        sql += f" LIMIT {page_size} OFFSET {offset}"
+
+        try:
+            cursor = self.db.execute(sql, params if params else None)
+            if cursor:
+                rows = cursor.fetchall()
+                return pd.DataFrame(rows)
+        except Exception as e:
+            logger.error(f"分页查询失败: {str(e)}")
+        return pd.DataFrame()
+
+    def _generic_get_statistics(self, table_name, count_exprs, default_stats):
+        """
+        通用统计查询
+
+        Args:
+            table_name: 表名
+            count_exprs: SQL统计表达式字符串（逗号分隔的聚合表达式）
+            default_stats: 查询失败时返回的默认统计字典
+
+        Returns:
+            dict: 统计信息字典
+        """
+        sql = f"SELECT COUNT(*) as total_count, {count_exprs} FROM {quote_identifier(table_name)}"
+
+        try:
+            cursor = self.db.execute(sql)
+            if cursor:
+                result = cursor.fetchone()
+                return result, result['total_count'] if result else 0
+        except Exception as e:
+            logger.error(f"获取统计信息失败: {str(e)}")
+        return None, 0
+
+    def _generic_export_batch(self, table_name, filters, filter_builder,
+                               count_method, paginated_method, batch_size=5000):
+        """
+        通用批量导出
+
+        Args:
+            table_name: 表名
+            filters: 过滤条件字典
+            filter_builder: 筛选条件构建函数
+            count_method: 计数方法引用
+            paginated_method: 分页方法引用
+            batch_size: 每批加载的记录数
+
+        Yields:
+            DataFrame: 每批结果数据帧
+        """
+        total = count_method(table_name, filters)
+        if total == 0:
+            return
+
+        offset = 0
+        while offset < total:
+            results = paginated_method(
+                table_name=table_name, filters=filters,
+                page=(offset // batch_size) + 1, page_size=batch_size
+            )
+            if not results.empty:
+                yield results
+            offset += batch_size
+
+    # ==================== 数据加载方法 ====================
     
     def load_enterprise_data(self, table_name, id_col, name_col, address_col, batch_size=None):
         """
@@ -70,20 +214,20 @@ class DataLoader:
         while True:
             if last_id is None:
                 sql = f"""
-                    SELECT {id_col}, {name_col}, {address_col}
-                    FROM {table_name}
-                    WHERE {address_col} IS NOT NULL AND {address_col} != ''
-                    ORDER BY {id_col}
+                    SELECT {quote_identifier(id_col)} AS id, {quote_identifier(name_col)} AS name, {quote_identifier(address_col)} AS address
+                    FROM {quote_identifier(table_name)}
+                    WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''
+                    ORDER BY {quote_identifier(id_col)}
                     LIMIT %s
                 """
                 cursor = self.db.execute(sql, (batch_size,))
             else:
                 sql = f"""
-                    SELECT {id_col}, {name_col}, {address_col}
-                    FROM {table_name}
-                    WHERE {address_col} IS NOT NULL AND {address_col} != ''
-                    AND {id_col} > %s
-                    ORDER BY {id_col}
+                    SELECT {quote_identifier(id_col)} AS id, {quote_identifier(name_col)} AS name, {quote_identifier(address_col)} AS address
+                    FROM {quote_identifier(table_name)}
+                    WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''
+                    AND {quote_identifier(id_col)} > %s
+                    ORDER BY {quote_identifier(id_col)}
                     LIMIT %s
                 """
                 cursor = self.db.execute(sql, (last_id, batch_size))
@@ -104,7 +248,7 @@ class DataLoader:
 
             df['id'] = df['id'].astype(str)
 
-            last_id = rows[-1][id_col]
+            last_id = rows[-1]['id']  # SELECT 使用 AS id 别名，RealDictCursor 以别名作为 key
             yield df
 
     def load_standard_addresses(self, table_name, id_col, address_col, room_col=None, batch_size=None):
@@ -132,40 +276,40 @@ class DataLoader:
             if room_col:
                 if last_id is None:
                     sql = f"""
-                        SELECT {id_col}, {address_col}, {room_col}
-                        FROM {table_name}
-                        WHERE {address_col} IS NOT NULL AND {address_col} != ''
-                        ORDER BY {id_col}
+                        SELECT {quote_identifier(id_col)} AS id, {quote_identifier(address_col)} AS address, {quote_identifier(room_col)} AS room_no
+                        FROM {quote_identifier(table_name)}
+                        WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''
+                        ORDER BY {quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (batch_size,))
                 else:
                     sql = f"""
-                        SELECT {id_col}, {address_col}, {room_col}
-                        FROM {table_name}
-                        WHERE {address_col} IS NOT NULL AND {address_col} != ''
-                        AND {id_col} > %s
-                        ORDER BY {id_col}
+                        SELECT {quote_identifier(id_col)} AS id, {quote_identifier(address_col)} AS address, {quote_identifier(room_col)} AS room_no
+                        FROM {quote_identifier(table_name)}
+                        WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''
+                        AND {quote_identifier(id_col)} > %s
+                        ORDER BY {quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (last_id, batch_size))
             else:
                 if last_id is None:
                     sql = f"""
-                        SELECT {id_col}, {address_col}
-                        FROM {table_name}
-                        WHERE {address_col} IS NOT NULL AND {address_col} != ''
-                        ORDER BY {id_col}
+                        SELECT {quote_identifier(id_col)} AS id, {quote_identifier(address_col)} AS address
+                        FROM {quote_identifier(table_name)}
+                        WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''
+                        ORDER BY {quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (batch_size,))
                 else:
                     sql = f"""
-                        SELECT {id_col}, {address_col}
-                        FROM {table_name}
-                        WHERE {address_col} IS NOT NULL AND {address_col} != ''
-                        AND {id_col} > %s
-                        ORDER BY {id_col}
+                        SELECT {quote_identifier(id_col)} AS id, {quote_identifier(address_col)} AS address
+                        FROM {quote_identifier(table_name)}
+                        WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''
+                        AND {quote_identifier(id_col)} > %s
+                        ORDER BY {quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (last_id, batch_size))
@@ -185,7 +329,7 @@ class DataLoader:
 
             df['id'] = df['id'].astype(str)
             
-            last_id = rows[-1][id_col]
+            last_id = rows[-1]['id']  # SELECT 使用 AS id 别名，RealDictCursor 以别名作为 key
             yield df
     
     def get_unvectorized_count(self, table_name, id_col, address_col, vector_table):
@@ -203,11 +347,11 @@ class DataLoader:
         """
         sql = f"""
             SELECT COUNT(*) as count
-            FROM {table_name} s
-            WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
+            FROM {quote_identifier(table_name)} s
+            WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
             AND NOT EXISTS (
-                SELECT 1 FROM {vector_table} v
-                WHERE v.source_id = s.{id_col}::text
+                SELECT 1 FROM {quote_identifier(vector_table)} v
+                WHERE v.source_id = s.{quote_identifier(id_col)}::text
             )
         """
         cursor = self.db.execute(sql)
@@ -240,28 +384,28 @@ class DataLoader:
         while True:
             if last_id is None:
                 sql = f"""
-                    SELECT s.{id_col}, s.{name_col}, s.{address_col}
-                    FROM {table_name} s
-                    WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
+                    SELECT s.{quote_identifier(id_col)} AS id, s.{quote_identifier(name_col)} AS name, s.{quote_identifier(address_col)} AS address
+                    FROM {quote_identifier(table_name)} s
+                    WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
                     AND NOT EXISTS (
-                        SELECT 1 FROM {vector_table} v
-                        WHERE v.source_id = s.{id_col}::text
+                        SELECT 1 FROM {quote_identifier(vector_table)} v
+                        WHERE v.source_id = s.{quote_identifier(id_col)}::text
                     )
-                    ORDER BY s.{id_col}
+                    ORDER BY s.{quote_identifier(id_col)}
                     LIMIT %s
                 """
                 cursor = self.db.execute(sql, (batch_size,))
             else:
                 sql = f"""
-                    SELECT s.{id_col}, s.{name_col}, s.{address_col}
-                    FROM {table_name} s
-                    WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
-                    AND s.{id_col} > %s
+                    SELECT s.{quote_identifier(id_col)} AS id, s.{quote_identifier(name_col)} AS name, s.{quote_identifier(address_col)} AS address
+                    FROM {quote_identifier(table_name)} s
+                    WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
+                    AND s.{quote_identifier(id_col)} > %s
                     AND NOT EXISTS (
-                        SELECT 1 FROM {vector_table} v
-                        WHERE v.source_id = s.{id_col}::text
+                        SELECT 1 FROM {quote_identifier(vector_table)} v
+                        WHERE v.source_id = s.{quote_identifier(id_col)}::text
                     )
-                    ORDER BY s.{id_col}
+                    ORDER BY s.{quote_identifier(id_col)}
                     LIMIT %s
                 """
                 cursor = self.db.execute(sql, (last_id, batch_size))
@@ -278,7 +422,7 @@ class DataLoader:
                 logger.error(f"Expected 3 columns but got {len(df.columns)}")
                 break
             df['id'] = df['id'].astype(str)
-            last_id = rows[-1][id_col]
+            last_id = rows[-1]['id']  # SELECT 使用 AS id 别名，RealDictCursor 以别名作为 key
             yield df
 
     def load_unvectorized_standard_addresses(self, table_name, id_col, address_col, room_col,
@@ -304,56 +448,56 @@ class DataLoader:
             if room_col:
                 if last_id is None:
                     sql = f"""
-                        SELECT s.{id_col}, s.{address_col}, s.{room_col}
-                        FROM {table_name} s
-                        WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
+                        SELECT s.{quote_identifier(id_col)} AS id, s.{quote_identifier(address_col)} AS address, s.{quote_identifier(room_col)} AS room_no
+                        FROM {quote_identifier(table_name)} s
+                        WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
                         AND NOT EXISTS (
-                            SELECT 1 FROM {vector_table} v
-                            WHERE v.source_id = s.{id_col}::text
+                            SELECT 1 FROM {quote_identifier(vector_table)} v
+                            WHERE v.source_id = s.{quote_identifier(id_col)}::text
                         )
-                        ORDER BY s.{id_col}
+                        ORDER BY s.{quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (batch_size,))
                 else:
                     sql = f"""
-                        SELECT s.{id_col}, s.{address_col}, s.{room_col}
-                        FROM {table_name} s
-                        WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
-                        AND s.{id_col} > %s
+                        SELECT s.{quote_identifier(id_col)} AS id, s.{quote_identifier(address_col)} AS address, s.{quote_identifier(room_col)} AS room_no
+                        FROM {quote_identifier(table_name)} s
+                        WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
+                        AND s.{quote_identifier(id_col)} > %s
                         AND NOT EXISTS (
-                            SELECT 1 FROM {vector_table} v
-                            WHERE v.source_id = s.{id_col}::text
+                            SELECT 1 FROM {quote_identifier(vector_table)} v
+                            WHERE v.source_id = s.{quote_identifier(id_col)}::text
                         )
-                        ORDER BY s.{id_col}
+                        ORDER BY s.{quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (last_id, batch_size))
             else:
                 if last_id is None:
                     sql = f"""
-                        SELECT s.{id_col}, s.{address_col}
-                        FROM {table_name} s
-                        WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
+                        SELECT s.{quote_identifier(id_col)} AS id, s.{quote_identifier(address_col)} AS address
+                        FROM {quote_identifier(table_name)} s
+                        WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
                         AND NOT EXISTS (
-                            SELECT 1 FROM {vector_table} v
-                            WHERE v.source_id = s.{id_col}::text
+                            SELECT 1 FROM {quote_identifier(vector_table)} v
+                            WHERE v.source_id = s.{quote_identifier(id_col)}::text
                         )
-                        ORDER BY s.{id_col}
+                        ORDER BY s.{quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (batch_size,))
                 else:
                     sql = f"""
-                        SELECT s.{id_col}, s.{address_col}
-                        FROM {table_name} s
-                        WHERE s.{address_col} IS NOT NULL AND s.{address_col} != ''
-                        AND s.{id_col} > %s
+                        SELECT s.{quote_identifier(id_col)} AS id, s.{quote_identifier(address_col)} AS address
+                        FROM {quote_identifier(table_name)} s
+                        WHERE s.{quote_identifier(address_col)} IS NOT NULL AND s.{quote_identifier(address_col)} != ''
+                        AND s.{quote_identifier(id_col)} > %s
                         AND NOT EXISTS (
-                            SELECT 1 FROM {vector_table} v
-                            WHERE v.source_id = s.{id_col}::text
+                            SELECT 1 FROM {quote_identifier(vector_table)} v
+                            WHERE v.source_id = s.{quote_identifier(id_col)}::text
                         )
-                        ORDER BY s.{id_col}
+                        ORDER BY s.{quote_identifier(id_col)}
                         LIMIT %s
                     """
                     cursor = self.db.execute(sql, (last_id, batch_size))
@@ -369,7 +513,7 @@ class DataLoader:
             else:
                 df.columns = ['id', 'address']
             df['id'] = df['id'].astype(str)
-            last_id = rows[-1][id_col]
+            last_id = rows[-1]['id']  # SELECT 使用 AS id 别名，RealDictCursor 以别名作为 key
             yield df
 
     def get_total_count(self, table_name):
@@ -382,7 +526,7 @@ class DataLoader:
         Returns:
             int: 记录数
         """
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
+        sql = f"SELECT COUNT(*) as count FROM {quote_identifier(table_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             result = cursor.fetchone()
@@ -400,7 +544,7 @@ class DataLoader:
         Returns:
             int: 有效地址记录数
         """
-        sql = f"SELECT COUNT(*) as count FROM {table_name} WHERE {address_col} IS NOT NULL AND {address_col} != ''"
+        sql = f"SELECT COUNT(*) as count FROM {quote_identifier(table_name)} WHERE {quote_identifier(address_col)} IS NOT NULL AND {quote_identifier(address_col)} != ''"
         cursor = self.db.execute(sql)
         if cursor:
             result = cursor.fetchone()
@@ -430,7 +574,7 @@ class DataLoader:
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
         sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                 id SERIAL PRIMARY KEY,
                 enterprise_id VARCHAR(255) NOT NULL,
                 enterprise_name TEXT,
@@ -453,33 +597,36 @@ class DataLoader:
     
     def insert_recall_results(self, results, table_name=None):
         """
-        批量插入粗召回结果
-        
+        批量插入粗召回结果（分批提交，避免大数据量时内存峰值过高）
+
         Args:
             results: 召回结果列表，每个元素包含 enterprise_id, enterprise_name, enterprise_address, candidates
             table_name: 表名，默认使用 Config.RECALL_RESULTS_TABLE
-        
+
         Returns:
             int: 成功插入的记录数
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
         if not results:
             return 0
-        
+
         sql = f"""
-            INSERT INTO {table_name} 
+            INSERT INTO {quote_identifier(table_name)}
             (enterprise_id, enterprise_name, enterprise_address, standard_id, standard_address, room_no, similarity)
             VALUES %s
         """
-        
+
         try:
-            values = []
+            total_inserted = 0
+            # 分批构建 values 并提交，避免一次性展开所有候选导致内存峰值
+            BATCH_SIZE = 5000
+            batch_values = []
             for item in results:
                 enterprise_id = str(item['enterprise_id'])
                 enterprise_name = item.get('enterprise_name', '')
                 enterprise_address = item['enterprise_address']
                 for candidate in item['candidates']:
-                    values.append((
+                    batch_values.append((
                         enterprise_id,
                         enterprise_name,
                         enterprise_address,
@@ -488,14 +635,37 @@ class DataLoader:
                         candidate.get('room_no', ''),
                         float(candidate['similarity'])
                     ))
-            
-            # 使用 execute_values 进行高效批量插入
-            psycopg2.extras.execute_values(
-                self.db.cursor, sql, values, template=None, page_size=1000
-            )
-            self.db.commit()
-            logger.info(f"Inserted {len(values)} recall results")
-            return len(values)
+                    # 达到批次大小时立即提交
+                    if len(batch_values) >= BATCH_SIZE:
+                        cursor = self.db.get_cursor()
+                        if not cursor:
+                            raise Exception("获取数据库游标失败")
+                        try:
+                            psycopg2.extras.execute_values(
+                                cursor, sql, batch_values, template=None, page_size=1000
+                            )
+                        finally:
+                            cursor.close()
+                        self.db.commit()
+                        total_inserted += len(batch_values)
+                        batch_values = []
+
+            # 提交剩余数据
+            if batch_values:
+                cursor = self.db.get_cursor()
+                if not cursor:
+                    raise Exception("获取数据库游标失败")
+                try:
+                    psycopg2.extras.execute_values(
+                        cursor, sql, batch_values, template=None, page_size=1000
+                    )
+                finally:
+                    cursor.close()
+                self.db.commit()
+                total_inserted += len(batch_values)
+
+            logger.info(f"Inserted {total_inserted} recall results")
+            return total_inserted
         except Exception as e:
             logger.error(f"Failed to insert recall results: {str(e)}")
             self.db.rollback()
@@ -515,7 +685,7 @@ class DataLoader:
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
         offset = (page - 1) * page_size
-        sql = f"SELECT * FROM {table_name} ORDER BY enterprise_id, similarity DESC LIMIT %s OFFSET %s"
+        sql = f"SELECT * FROM {quote_identifier(table_name)} ORDER BY enterprise_id, similarity DESC LIMIT %s OFFSET %s"
         cursor = self.db.execute(sql, (page_size, offset))
         if cursor:
             rows = cursor.fetchall()
@@ -565,23 +735,7 @@ class DataLoader:
             int: 记录总数
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
-
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
-        params = None
-
-        if filters:
-            conditions, params = self._build_recall_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        try:
-            cursor = self.db.execute(sql, params)
-            if cursor:
-                result = cursor.fetchone()
-                return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f"Failed to get recall results count: {str(e)}")
-        return 0
+        return self._generic_get_count(table_name, filters, self._build_recall_filter_conditions)
 
     def get_recall_results_paginated(self, table_name=None, filters=None, page=1, page_size=20):
         """
@@ -598,46 +752,23 @@ class DataLoader:
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
 
-        sql = f"SELECT * FROM {table_name}"
-        params = []
-
-        if filters:
-            conditions, params = self._build_recall_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        sql += " ORDER BY enterprise_id, similarity DESC"
-
-        offset = (page - 1) * page_size
-        sql += f" LIMIT {page_size} OFFSET {offset}"
-
-        try:
-            cursor = self.db.execute(sql, params if params else None)
-            if cursor:
-                rows = cursor.fetchall()
-                return pd.DataFrame(rows)
-        except Exception as e:
-            logger.error(f"Failed to get paginated recall results: {str(e)}")
-        return pd.DataFrame()
+        return self._generic_get_paginated(
+            table_name, filters, self._build_recall_filter_conditions,
+            page=page, page_size=page_size, order_by='enterprise_id, similarity DESC, id ASC'
+        )
     
     def truncate_recall_table(self, table_name=None):
         """
         清空粗召回结果表
-        
+
         Args:
             table_name: 表名，默认使用 Config.RECALL_RESULTS_TABLE
-        
+
         Returns:
             bool: 清空成功返回 True
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
-        sql = f"TRUNCATE TABLE {table_name}"
-        cursor = self.db.execute(sql)
-        if cursor:
-            self.db.commit()
-            logger.info(f"Recall table {table_name} truncated successfully")
-            return True
-        return False
+        return self._generic_truncate_table(table_name, log_label='Recall table ')
     
     def load_recall_results(self, table_name=None):
         """
@@ -659,7 +790,7 @@ class DataLoader:
                 standard_address,
                 room_no,
                 similarity
-            FROM {table_name}
+            FROM {quote_identifier(table_name)}
             ORDER BY enterprise_id, similarity DESC
         """
         cursor = self.db.execute(sql)
@@ -739,7 +870,7 @@ class DataLoader:
         table_name = table_name or Config.RESULT_TABLE
         
         sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                 id SERIAL PRIMARY KEY,
                 enterprise_id VARCHAR(255) NOT NULL,
                 enterprise_name TEXT,
@@ -789,7 +920,7 @@ class DataLoader:
                        f"exact_match={r.get('exact_match', 0)}, partial_match={r.get('partial_match', 0)}, not_match={r.get('not_match', 0)}")
         
         sql = f"""
-            INSERT INTO {table_name} 
+            INSERT INTO {quote_identifier(table_name)} 
             (enterprise_id, enterprise_name, enterprise_address, address_id, standard_address, room_no, 
              partial_match, exact_match, not_match, match_status)
             VALUES %s
@@ -812,9 +943,15 @@ class DataLoader:
                 for r in results
             ]
             
-            psycopg2.extras.execute_values(
-                self.db.cursor, sql, values, template=None, page_size=1000
-            )
+            cursor = self.db.get_cursor()
+            if not cursor:
+                raise Exception("获取数据库游标失败")
+            try:
+                psycopg2.extras.execute_values(
+                    cursor, sql, values, template=None, page_size=1000
+                )
+            finally:
+                cursor.close()
             self.db.commit()
             logger.info(f"Inserted {len(results)} match results into {table_name}")
             return len(results)
@@ -845,7 +982,7 @@ class DataLoader:
             DataFrame: 匹配结果数据帧
         """
         table_name = table_name or Config.RESULT_TABLE
-        sql = f"SELECT * FROM {table_name}"
+        sql = f"SELECT * FROM {quote_identifier(table_name)}"
         params = None
         
         if filters:
@@ -916,73 +1053,41 @@ class DataLoader:
     def get_match_results_count(self, table_name=None, filters=None):
         """
         获取匹配结果总数（用于分页）
-        
+
         Args:
             table_name: 表名，默认使用 Config.RESULT_TABLE
             filters: 过滤条件字典
-        
+
         Returns:
             int: 记录总数
         """
         table_name = table_name or Config.RESULT_TABLE
-        
+
         self.create_result_table(table_name)
-        
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
-        params = None
-        
-        if filters:
-            conditions, params = self._build_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-        
-        try:
-            cursor = self.db.execute(sql, params)
-            if cursor:
-                result = cursor.fetchone()
-                return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f"Failed to get match results count: {str(e)}")
-        return 0
+
+        return self._generic_get_count(table_name, filters, self._build_filter_conditions)
     
     def get_match_results_paginated(self, table_name=None, filters=None, page=1, page_size=20):
         """
         分页获取匹配结果
-        
+
         Args:
             table_name: 表名，默认使用 Config.RESULT_TABLE
             filters: 过滤条件字典
             page: 页码（从1开始）
             page_size: 每页记录数
-        
+
         Returns:
             DataFrame: 匹配结果数据帧
         """
         table_name = table_name or Config.RESULT_TABLE
-        
+
         self.create_result_table(table_name)
-        
-        sql = f"SELECT * FROM {table_name}"
-        params = []
-        
-        if filters:
-            conditions, params = self._build_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-        
-        sql += " ORDER BY exact_match DESC, partial_match DESC"
-        
-        offset = (page - 1) * page_size
-        sql += f" LIMIT {page_size} OFFSET {offset}"
-        
-        try:
-            cursor = self.db.execute(sql, params if params else None)
-            if cursor:
-                rows = cursor.fetchall()
-                return pd.DataFrame(rows)
-        except Exception as e:
-            logger.error(f"Failed to get paginated match results: {str(e)}")
-        return pd.DataFrame()
+
+        return self._generic_get_paginated(
+            table_name, filters, self._build_filter_conditions,
+            page=page, page_size=page_size, order_by='exact_match DESC, partial_match DESC, id ASC'
+        )
     
     def get_result_count(self, table_name=None):
         """
@@ -995,7 +1100,7 @@ class DataLoader:
             int: 记录数
         """
         table_name = table_name or Config.RESULT_TABLE
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
+        sql = f"SELECT COUNT(*) as count FROM {quote_identifier(table_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             result = cursor.fetchone()
@@ -1020,7 +1125,7 @@ class DataLoader:
             if cursor:
                 rows = cursor.fetchall()
                 if not rows:
-                    alter_sql = f"ALTER TABLE {table_name} ADD COLUMN correction_source VARCHAR(20) DEFAULT '自动匹配'"
+                    alter_sql = f"ALTER TABLE {quote_identifier(table_name)} ADD COLUMN correction_source VARCHAR(20) DEFAULT '自动匹配'"
                     self.db.execute(alter_sql)
                     self.db.commit()
                     logger.info(f"Added correction_source column to {table_name}")
@@ -1058,7 +1163,7 @@ class DataLoader:
         if float_columns:
             for col in float_columns:
                 try:
-                    alter_sql = f"ALTER TABLE {table_name} ALTER COLUMN {col} TYPE DOUBLE PRECISION"
+                    alter_sql = f"ALTER TABLE {quote_identifier(table_name)} ALTER COLUMN {quote_identifier(col)} TYPE DOUBLE PRECISION"
                     self.db.execute(alter_sql)
                     logger.info(f"Migrated {table_name}.{col} from FLOAT to DOUBLE PRECISION")
                 except Exception as e:
@@ -1087,31 +1192,51 @@ class DataLoader:
             if cursor and cursor.fetchone():
                 return
 
-            alter_sql = f"ALTER TABLE {table_name} ADD COLUMN identifier TEXT"
+            alter_sql = f"ALTER TABLE {quote_identifier(table_name)} ADD COLUMN identifier TEXT"
             self.db.execute(alter_sql)
             self.db.commit()
             logger.info(f"Added identifier column to {table_name}")
         except Exception as e:
             logger.warning(f"Failed to add identifier column to {table_name}: {e}")
 
+    def _migrate_mgeo_similarity_add_extra_col(self, table_name):
+        """
+        为旧版 mgeo_similarity_results 表添加 extra_col 列（如果不存在）
+
+        Args:
+            table_name: 表名
+        """
+        try:
+            schema = self.db.schema if hasattr(self.db, 'schema') else 'public'
+            check_sql = f"""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                AND column_name = 'extra_col'
+            """
+            cursor = self.db.execute(check_sql, (schema, table_name))
+            if cursor and cursor.fetchone():
+                return
+
+            alter_sql = f"ALTER TABLE {quote_identifier(table_name)} ADD COLUMN extra_col TEXT"
+            self.db.execute(alter_sql)
+            self.db.commit()
+            logger.info(f"Added extra_col column to {table_name}")
+        except Exception as e:
+            logger.warning(f"Failed to add extra_col column to {table_name}: {e}")
+
     def truncate_result_table(self, table_name=None):
         """
         清空匹配结果表
-        
+
         Args:
             table_name: 表名，默认使用 Config.RESULT_TABLE
-        
+
         Returns:
             bool: 清空成功返回 True
         """
         table_name = table_name or Config.RESULT_TABLE
-        sql = f"TRUNCATE TABLE {table_name}"
-        cursor = self.db.execute(sql)
-        if cursor:
-            self.db.commit()
-            logger.info(f"Result table {table_name} truncated successfully")
-            return True
-        return False
+        return self._generic_truncate_table(table_name, log_label='Result table ')
     
     def export_recall_results_batch(self, batch_size=5000, table_name=None):
         """
@@ -1125,7 +1250,7 @@ class DataLoader:
             DataFrame: 每批召回结果数据帧
         """
         table_name = table_name or Config.RECALL_RESULTS_TABLE
-        count_sql = f"SELECT COUNT(*) as count FROM {table_name}"
+        count_sql = f"SELECT COUNT(*) as count FROM {quote_identifier(table_name)}"
         count_cursor = self.db.execute(count_sql)
         total = count_cursor.fetchone()['count'] if count_cursor else 0
         
@@ -1134,7 +1259,7 @@ class DataLoader:
         
         offset = 0
         while offset < total:
-            sql = f"SELECT * FROM {table_name} ORDER BY id LIMIT {batch_size} OFFSET {offset}"
+            sql = f"SELECT * FROM {quote_identifier(table_name)} ORDER BY id LIMIT {batch_size} OFFSET {offset}"
             cursor = self.db.execute(sql)
             if cursor:
                 rows = cursor.fetchall()
@@ -1148,6 +1273,8 @@ class DataLoader:
 
         表结构:
             id: 主键
+            identifier: 标识字段
+            extra_col: 其他附加字段
             address_a: 地址A
             address_b: 地址B
             exact_match: 精确匹配概率
@@ -1165,9 +1292,10 @@ class DataLoader:
         table_name = table_name or Config.MGEO_SIMILARITY_RESULTS_TABLE
 
         sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                 id SERIAL PRIMARY KEY,
                 identifier TEXT,
+                extra_col TEXT,
                 address_a TEXT,
                 address_b TEXT,
                 exact_match DOUBLE PRECISION DEFAULT 0.0,
@@ -1184,6 +1312,7 @@ class DataLoader:
 
         self._migrate_float_to_double(table_name)
         self._migrate_mgeo_similarity_add_identifier(table_name)
+        self._migrate_mgeo_similarity_add_extra_col(table_name)
 
         return True
 
@@ -1192,7 +1321,7 @@ class DataLoader:
         批量插入MGeo地址相似度匹配结果
 
         Args:
-            results: 匹配结果列表，每个元素包含 address_a, address_b,
+            results: 匹配结果列表，每个元素包含 address_a, address_b, identifier, extra_col,
                      exact_match, partial_match, not_match, match_status
             table_name: 表名，默认使用 Config.MGEO_SIMILARITY_RESULTS_TABLE
 
@@ -1204,8 +1333,8 @@ class DataLoader:
             return 0
 
         sql = f"""
-            INSERT INTO {table_name}
-            (address_a, address_b, identifier, exact_match, partial_match, not_match, match_status)
+            INSERT INTO {quote_identifier(table_name)}
+            (address_a, address_b, identifier, extra_col, exact_match, partial_match, not_match, match_status)
             VALUES %s
         """
 
@@ -1215,6 +1344,7 @@ class DataLoader:
                     r['address_a'],
                     r['address_b'],
                     r.get('identifier'),
+                    r.get('extra_col'),
                     float(r.get('exact_match', 0.0)),
                     float(r.get('partial_match', 0.0)),
                     float(r.get('not_match', 0.0)),
@@ -1223,9 +1353,15 @@ class DataLoader:
                 for r in results
             ]
 
-            psycopg2.extras.execute_values(
-                self.db.cursor, sql, values, template=None, page_size=1000
-            )
+            cursor = self.db.get_cursor()
+            if not cursor:
+                raise Exception("获取数据库游标失败")
+            try:
+                psycopg2.extras.execute_values(
+                    cursor, sql, values, template=None, page_size=1000
+                )
+            finally:
+                cursor.close()
             self.db.commit()
             logger.info(f"Inserted {len(results)} MGeo similarity results into {table_name}")
             return len(results)
@@ -1245,13 +1381,7 @@ class DataLoader:
             bool: 清空成功返回 True
         """
         table_name = table_name or Config.MGEO_SIMILARITY_RESULTS_TABLE
-        sql = f"TRUNCATE TABLE {table_name}"
-        cursor = self.db.execute(sql)
-        if cursor:
-            self.db.commit()
-            logger.info(f"MGeo similarity table {table_name} truncated successfully")
-            return True
-        return False
+        return self._generic_truncate_table(table_name, log_label='MGeo similarity table ')
 
     def get_mgeo_similarity_results_count(self, table_name=None, filters=None):
         """
@@ -1268,22 +1398,7 @@ class DataLoader:
 
         self.create_mgeo_similarity_table(table_name)
 
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
-        params = None
-
-        if filters:
-            conditions, params = self._build_mgeo_similarity_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        try:
-            cursor = self.db.execute(sql, params)
-            if cursor:
-                result = cursor.fetchone()
-                return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f"Failed to get MGeo similarity results count: {str(e)}")
-        return 0
+        return self._generic_get_count(table_name, filters, self._build_mgeo_similarity_filter_conditions)
 
     def get_mgeo_similarity_results_paginated(self, table_name=None, filters=None, page=1, page_size=20):
         """
@@ -1302,27 +1417,10 @@ class DataLoader:
 
         self.create_mgeo_similarity_table(table_name)
 
-        sql = f"SELECT * FROM {table_name}"
-        params = []
-
-        if filters:
-            conditions, params = self._build_mgeo_similarity_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        sql += " ORDER BY exact_match DESC, partial_match DESC"
-
-        offset = (page - 1) * page_size
-        sql += f" LIMIT {page_size} OFFSET {offset}"
-
-        try:
-            cursor = self.db.execute(sql, params if params else None)
-            if cursor:
-                rows = cursor.fetchall()
-                return pd.DataFrame(rows)
-        except Exception as e:
-            logger.error(f"Failed to get paginated MGeo similarity results: {str(e)}")
-        return pd.DataFrame()
+        return self._generic_get_paginated(
+            table_name, filters, self._build_mgeo_similarity_filter_conditions,
+            page=page, page_size=page_size, order_by='exact_match DESC, partial_match DESC, id ASC'
+        )
 
     def get_mgeo_similarity_statistics(self, table_name=None):
         """
@@ -1338,53 +1436,39 @@ class DataLoader:
 
         self.create_mgeo_similarity_table(table_name)
 
-        sql = f"""
-            SELECT
-                COUNT(*) as total_count,
-                SUM(CASE WHEN match_status = '精确匹配' THEN 1 ELSE 0 END) as exact_match_count,
+        count_exprs = """SUM(CASE WHEN match_status = '精确匹配' THEN 1 ELSE 0 END) as exact_match_count,
                 SUM(CASE WHEN match_status = '部分匹配' THEN 1 ELSE 0 END) as partial_match_count,
                 SUM(CASE WHEN match_status = '不匹配' THEN 1 ELSE 0 END) as not_match_count,
                 AVG(exact_match) as avg_exact_match,
                 AVG(partial_match) as avg_partial_match,
-                AVG(not_match) as avg_not_match
-            FROM {table_name}
-        """
+                AVG(not_match) as avg_not_match"""
 
-        try:
-            cursor = self.db.execute(sql)
-            if cursor:
-                result = cursor.fetchone()
-                total = result['total_count'] if result else 0
-                exact_count = result['exact_match_count'] if result else 0
-                partial_count = result['partial_match_count'] if result else 0
-                not_count = result['not_match_count'] if result else 0
-                return {
-                    'total_count': total,
-                    'exact_match_count': exact_count,
-                    'partial_match_count': partial_count,
-                    'not_match_count': not_count,
-                    'match_rate': ((exact_count + partial_count) / total * 100) if total > 0 else 0,
-                    'exact_match_rate': (exact_count / total * 100) if total > 0 else 0,
-                    'partial_match_rate': (partial_count / total * 100) if total > 0 else 0,
-                    'not_match_rate': (not_count / total * 100) if total > 0 else 0,
-                    'avg_exact_match': float(result['avg_exact_match']) if result and result['avg_exact_match'] else 0.0,
-                    'avg_partial_match': float(result['avg_partial_match']) if result and result['avg_partial_match'] else 0.0,
-                    'avg_not_match': float(result['avg_not_match']) if result and result['avg_not_match'] else 0.0
-                }
-        except Exception as e:
-            logger.error(f"Failed to get MGeo similarity statistics: {str(e)}")
+        default_stats = {
+            'total_count': 0, 'exact_match_count': 0, 'partial_match_count': 0,
+            'not_match_count': 0, 'match_rate': 0, 'exact_match_rate': 0,
+            'partial_match_rate': 0, 'not_match_rate': 0,
+            'avg_exact_match': 0.0, 'avg_partial_match': 0.0, 'avg_not_match': 0.0
+        }
+
+        result, total = self._generic_get_statistics(table_name, count_exprs, default_stats)
+        if result is None:
+            return default_stats
+
+        exact_count = result['exact_match_count'] if result else 0
+        partial_count = result['partial_match_count'] if result else 0
+        not_count = result['not_match_count'] if result else 0
         return {
-            'total_count': 0,
-            'exact_match_count': 0,
-            'partial_match_count': 0,
-            'not_match_count': 0,
-            'match_rate': 0,
-            'exact_match_rate': 0,
-            'partial_match_rate': 0,
-            'not_match_rate': 0,
-            'avg_exact_match': 0.0,
-            'avg_partial_match': 0.0,
-            'avg_not_match': 0.0
+            'total_count': total,
+            'exact_match_count': exact_count,
+            'partial_match_count': partial_count,
+            'not_match_count': not_count,
+            'match_rate': ((exact_count + partial_count) / total * 100) if total > 0 else 0,
+            'exact_match_rate': (exact_count / total * 100) if total > 0 else 0,
+            'partial_match_rate': (partial_count / total * 100) if total > 0 else 0,
+            'not_match_rate': (not_count / total * 100) if total > 0 else 0,
+            'avg_exact_match': float(result['avg_exact_match']) if result and result['avg_exact_match'] else 0.0,
+            'avg_partial_match': float(result['avg_partial_match']) if result and result['avg_partial_match'] else 0.0,
+            'avg_not_match': float(result['avg_not_match']) if result and result['avg_not_match'] else 0.0
         }
 
     def export_mgeo_similarity_results_batch(self, table_name=None, filters=None, batch_size=5000):
@@ -1402,21 +1486,12 @@ class DataLoader:
         table_name = table_name or Config.MGEO_SIMILARITY_RESULTS_TABLE
         self.create_mgeo_similarity_table(table_name)
 
-        total = self.get_mgeo_similarity_results_count(table_name, filters)
-        if total == 0:
-            return
-
-        offset = 0
-        while offset < total:
-            results = self.get_mgeo_similarity_results_paginated(
-                table_name=table_name,
-                filters=filters,
-                page=(offset // batch_size) + 1,
-                page_size=batch_size
-            )
-            if not results.empty:
-                yield results
-            offset += batch_size
+        yield from self._generic_export_batch(
+            table_name, filters, self._build_mgeo_similarity_filter_conditions,
+            self.get_mgeo_similarity_results_count,
+            self.get_mgeo_similarity_results_paginated,
+            batch_size=batch_size
+        )
 
     def create_address_tagging_table(self, table_name=None):
         """
@@ -1448,7 +1523,7 @@ class DataLoader:
         table_name = table_name or Config.ADDRESS_TAGGING_RESULTS_TABLE
 
         sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                 id SERIAL PRIMARY KEY,
                 original_address TEXT,
                 province VARCHAR(100) DEFAULT '',
@@ -1460,9 +1535,9 @@ class DataLoader:
                 roadno VARCHAR(100) DEFAULT '',
                 area VARCHAR(200) DEFAULT '',
                 bldg VARCHAR(200) DEFAULT '',
-                unit VARCHAR(50) DEFAULT '',
-                floor VARCHAR(50) DEFAULT '',
-                house VARCHAR(50) DEFAULT '',
+                unit VARCHAR(200) DEFAULT '',
+                floor VARCHAR(200) DEFAULT '',
+                house VARCHAR(200) DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
@@ -1470,6 +1545,14 @@ class DataLoader:
         if cursor:
             self.db.commit()
             logger.info(f"Address tagging result table {table_name} created successfully")
+
+        # 为原始地址添加索引，加速副本表JOIN和结果查询
+        try:
+            index_sql = f"CREATE INDEX IF NOT EXISTS idx_{table_name}_original_address ON {quote_identifier(table_name)}(original_address)"
+            self.db.execute(index_sql)
+            self.db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to create index on {table_name}.original_address: {e}")
 
         return True
 
@@ -1484,13 +1567,7 @@ class DataLoader:
             bool: 清空成功返回 True
         """
         table_name = table_name or Config.ADDRESS_TAGGING_RESULTS_TABLE
-        sql = f"TRUNCATE TABLE {table_name}"
-        cursor = self.db.execute(sql)
-        if cursor:
-            self.db.commit()
-            logger.info(f"Address tagging table {table_name} truncated successfully")
-            return True
-        return False
+        return self._generic_truncate_table(table_name, log_label='Address tagging table ')
 
     def insert_address_tagging_results(self, results, table_name=None):
         """
@@ -1508,7 +1585,7 @@ class DataLoader:
             return 0
 
         sql = f"""
-            INSERT INTO {table_name}
+            INSERT INTO {quote_identifier(table_name)}
             (original_address, province, city, district, street, community,
              road, roadno, area, bldg, unit, floor, house)
             VALUES %s
@@ -1534,9 +1611,15 @@ class DataLoader:
                 for r in results
             ]
 
-            psycopg2.extras.execute_values(
-                self.db.cursor, sql, values, template=None, page_size=1000
-            )
+            cursor = self.db.get_cursor()
+            if not cursor:
+                raise Exception("获取数据库游标失败")
+            try:
+                psycopg2.extras.execute_values(
+                    cursor, sql, values, template=None, page_size=1000
+                )
+            finally:
+                cursor.close()
             self.db.commit()
             logger.info(f"Inserted {len(results)} address tagging results into {table_name}")
             return len(results)
@@ -1560,22 +1643,7 @@ class DataLoader:
 
         self.create_address_tagging_table(table_name)
 
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
-        params = None
-
-        if filters:
-            conditions, params = self._build_address_tagging_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        try:
-            cursor = self.db.execute(sql, params)
-            if cursor:
-                result = cursor.fetchone()
-                return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f"Failed to get address tagging results count: {str(e)}")
-        return 0
+        return self._generic_get_count(table_name, filters, self._build_address_tagging_filter_conditions)
 
     def get_address_tagging_results_paginated(self, table_name=None, filters=None, page=1, page_size=20):
         """
@@ -1594,27 +1662,10 @@ class DataLoader:
 
         self.create_address_tagging_table(table_name)
 
-        sql = f"SELECT * FROM {table_name}"
-        params = []
-
-        if filters:
-            conditions, params = self._build_address_tagging_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        sql += " ORDER BY id"
-
-        offset = (page - 1) * page_size
-        sql += f" LIMIT {page_size} OFFSET {offset}"
-
-        try:
-            cursor = self.db.execute(sql, params if params else None)
-            if cursor:
-                rows = cursor.fetchall()
-                return pd.DataFrame(rows)
-        except Exception as e:
-            logger.error(f"Failed to get paginated address tagging results: {str(e)}")
-        return pd.DataFrame()
+        return self._generic_get_paginated(
+            table_name, filters, self._build_address_tagging_filter_conditions,
+            page=page, page_size=page_size, order_by='id'
+        )
 
     def get_address_tagging_statistics(self, table_name=None):
         """
@@ -1633,36 +1684,25 @@ class DataLoader:
         fields = ['province', 'city', 'district', 'street', 'community',
                    'road', 'roadno', 'area', 'bldg', 'unit', 'floor', 'house']
         count_exprs = ', '.join([
-            f"SUM(CASE WHEN {f} IS NOT NULL AND {f} != '' THEN 1 ELSE 0 END) as {f}_count"
+            f"SUM(CASE WHEN {quote_identifier(f)} IS NOT NULL AND {quote_identifier(f)} != '' THEN 1 ELSE 0 END) as {f}_count"
             for f in fields
         ])
-
-        sql = f"""
-            SELECT
-                COUNT(*) as total_count,
-                {count_exprs}
-            FROM {table_name}
-        """
-
-        try:
-            cursor = self.db.execute(sql)
-            if cursor:
-                result = cursor.fetchone()
-                total = result['total_count'] if result else 0
-                stats = {'total_count': total}
-                for f in fields:
-                    count = result[f'{f}_count'] if result else 0
-                    stats[f'{f}_count'] = count
-                    stats[f'{f}_rate'] = (count / total * 100) if total > 0 else 0
-                return stats
-        except Exception as e:
-            logger.error(f"Failed to get address tagging statistics: {str(e)}")
 
         default_stats = {'total_count': 0}
         for f in fields:
             default_stats[f'{f}_count'] = 0
             default_stats[f'{f}_rate'] = 0
-        return default_stats
+
+        result, total = self._generic_get_statistics(table_name, count_exprs, default_stats)
+        if result is None:
+            return default_stats
+
+        stats = {'total_count': total}
+        for f in fields:
+            count = result[f'{f}_count'] if result else 0
+            stats[f'{f}_count'] = count
+            stats[f'{f}_rate'] = (count / total * 100) if total > 0 else 0
+        return stats
 
     def _build_address_tagging_filter_conditions(self, filters):
         """
@@ -1709,21 +1749,12 @@ class DataLoader:
         table_name = table_name or Config.ADDRESS_TAGGING_RESULTS_TABLE
         self.create_address_tagging_table(table_name)
 
-        total = self.get_address_tagging_results_count(table_name, filters)
-        if total == 0:
-            return
-
-        offset = 0
-        while offset < total:
-            results = self.get_address_tagging_results_paginated(
-                table_name=table_name,
-                filters=filters,
-                page=(offset // batch_size) + 1,
-                page_size=batch_size
-            )
-            if not results.empty:
-                yield results
-            offset += batch_size
+        yield from self._generic_export_batch(
+            table_name, filters, self._build_address_tagging_filter_conditions,
+            self.get_address_tagging_results_count,
+            self.get_address_tagging_results_paginated,
+            batch_size=batch_size
+        )
 
     def create_tagging_copy_table(self, source_table, address_col, results, table_suffix='_tagging'):
         """
@@ -1745,20 +1776,30 @@ class DataLoader:
             self.db.execute(drop_sql)
             self.db.commit()
 
+            tagging_fields = ['province', 'city', 'district', 'street', 'community',
+                              'road', 'roadno', 'area', 'bldg', 'unit', 'floor', 'house']
+            # 保留源表全部字段（与 create_tagging_17_copy_table 保持一致），
+            # 副本表可用于后续业务分析，不只局限于分词结果查看
+            field_type_map = {
+                'province': 'VARCHAR(100)', 'city': 'VARCHAR(100)', 'district': 'VARCHAR(100)',
+                'street': 'VARCHAR(100)', 'community': 'VARCHAR(100)',
+                'road': 'VARCHAR(200)', 'roadno': 'VARCHAR(100)',
+                'area': 'VARCHAR(200)', 'bldg': 'VARCHAR(200)',
+                'unit': 'VARCHAR(200)', 'floor': 'VARCHAR(200)', 'house': 'VARCHAR(200)',
+            }
             create_sql = f"CREATE TABLE {quote_identifier(copy_table)} AS SELECT * FROM {quote_identifier(source_table)}"
             self.db.execute(create_sql)
             self.db.commit()
 
-            tagging_fields = ['province', 'city', 'district', 'street', 'community',
-                              'road', 'roadno', 'area', 'bldg', 'unit', 'floor', 'house']
-            for field in tagging_fields:
-                alter_sql = f"ALTER TABLE {copy_table} ADD COLUMN IF NOT EXISTS {field} VARCHAR(200) DEFAULT ''"
+            # 添加12级分词字段（如源表已有同名列则跳过，用IF NOT EXISTS保证幂等）
+            for f in tagging_fields:
+                alter_sql = f"ALTER TABLE {quote_identifier(copy_table)} ADD COLUMN IF NOT EXISTS {quote_identifier(f)} {field_type_map[f]} DEFAULT ''"
                 self.db.execute(alter_sql)
             self.db.commit()
 
             if results:
-                set_clause = ', '.join([f"{f} = %s" for f in tagging_fields])
-                update_sql = f"UPDATE {copy_table} SET {set_clause} WHERE {address_col} = %s"
+                set_clause = ', '.join([f"{quote_identifier(f)} = %s" for f in tagging_fields])
+                update_sql = f"UPDATE {quote_identifier(copy_table)} SET {set_clause} WHERE {quote_identifier(address_col)} = %s"
                 batch_size = 500
                 for i in range(0, len(results), batch_size):
                     batch = results[i:i + batch_size]
@@ -1800,7 +1841,7 @@ class DataLoader:
         table_name = table_name or Config.ADDRESS_TAGGING_17_RESULTS_TABLE
 
         sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                 id SERIAL PRIMARY KEY,
                 _id_field TEXT DEFAULT '',
                 dom_json TEXT DEFAULT '',
@@ -1828,13 +1869,6 @@ class DataLoader:
         cursor = self.db.execute(sql)
         if cursor:
             self.db.commit()
-            # 兼容旧表：添加可能缺失的列
-            for col, col_type in [('_id_field', 'TEXT DEFAULT \'\''), ('dom_json', 'TEXT DEFAULT \'\'')]:
-                try:
-                    self.db.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {col} {col_type}")
-                    self.db.commit()
-                except Exception:
-                    pass
             logger.info(f"17级地址结构化解析结果表 {table_name} 创建成功")
 
         return True
@@ -1842,12 +1876,7 @@ class DataLoader:
     def truncate_address_tagging_17_table(self, table_name=None):
         """清空17级地址结构化解析结果表"""
         table_name = table_name or Config.ADDRESS_TAGGING_17_RESULTS_TABLE
-        cursor = self.db.execute(f"TRUNCATE TABLE {table_name}")
-        if cursor:
-            self.db.commit()
-            logger.info(f"17级地址结构化解析结果表 {table_name} 已清空")
-            return True
-        return False
+        return self._generic_truncate_table(table_name, log_label='17级地址结构化解析结果表 ')
 
     def insert_address_tagging_17_results(self, results, table_name=None):
         """
@@ -1866,7 +1895,7 @@ class DataLoader:
 
         fields = self._tagging_17_fields()
         columns = ['_id_field', 'dom_json', 'original_address'] + fields
-        sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES %s"
+        sql = f"INSERT INTO {quote_identifier(table_name)} ({', '.join(quote_identifier(c) for c in columns)}) VALUES %s"
 
         try:
             values = [
@@ -1878,9 +1907,15 @@ class DataLoader:
                 )
                 for r in results
             ]
-            psycopg2.extras.execute_values(
-                self.db.cursor, sql, values, template=None, page_size=1000
-            )
+            cursor = self.db.get_cursor()
+            if not cursor:
+                raise Exception("获取数据库游标失败")
+            try:
+                psycopg2.extras.execute_values(
+                    cursor, sql, values, template=None, page_size=1000
+                )
+            finally:
+                cursor.close()
             self.db.commit()
             logger.info(f"已插入 {len(results)} 条17级地址结构化解析结果到 {table_name}")
             return len(results)
@@ -1894,46 +1929,17 @@ class DataLoader:
         table_name = table_name or Config.ADDRESS_TAGGING_17_RESULTS_TABLE
         self.create_address_tagging_17_table(table_name)
 
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
-        params = None
-        if filters:
-            conditions, params = self._build_address_tagging_17_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        try:
-            cursor = self.db.execute(sql, params)
-            if cursor:
-                result = cursor.fetchone()
-                return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f"获取17级地址结构化解析结果总数失败: {str(e)}")
-        return 0
+        return self._generic_get_count(table_name, filters, self._build_address_tagging_17_filter_conditions)
 
     def get_address_tagging_17_results_paginated(self, table_name=None, filters=None, page=1, page_size=20):
         """分页获取17级地址结构化解析结果"""
         table_name = table_name or Config.ADDRESS_TAGGING_17_RESULTS_TABLE
         self.create_address_tagging_17_table(table_name)
 
-        sql = f"SELECT * FROM {table_name}"
-        params = []
-        if filters:
-            conditions, params = self._build_address_tagging_17_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        sql += " ORDER BY id"
-        offset = (page - 1) * page_size
-        sql += f" LIMIT {page_size} OFFSET {offset}"
-
-        try:
-            cursor = self.db.execute(sql, params if params else None)
-            if cursor:
-                rows = cursor.fetchall()
-                return pd.DataFrame(rows)
-        except Exception as e:
-            logger.error(f"分页获取17级地址结构化解析结果失败: {str(e)}")
-        return pd.DataFrame()
+        return self._generic_get_paginated(
+            table_name, filters, self._build_address_tagging_17_filter_conditions,
+            page=page, page_size=page_size, order_by='id'
+        )
 
     def get_address_tagging_17_statistics(self, table_name=None):
         """获取17级地址结构化解析统计信息"""
@@ -1942,31 +1948,25 @@ class DataLoader:
 
         fields = self._tagging_17_fields()
         count_exprs = ', '.join([
-            f"SUM(CASE WHEN {f} IS NOT NULL AND {f} != '' THEN 1 ELSE 0 END) as {f}_count"
+            f"SUM(CASE WHEN {quote_identifier(f)} IS NOT NULL AND {quote_identifier(f)} != '' THEN 1 ELSE 0 END) as {f}_count"
             for f in fields
         ])
-
-        sql = f"SELECT COUNT(*) as total_count, {count_exprs} FROM {table_name}"
-
-        try:
-            cursor = self.db.execute(sql)
-            if cursor:
-                result = cursor.fetchone()
-                total = result['total_count'] if result else 0
-                stats = {'total_count': total}
-                for f in fields:
-                    count = result[f'{f}_count'] if result else 0
-                    stats[f'{f}_count'] = count
-                    stats[f'{f}_rate'] = (count / total * 100) if total > 0 else 0
-                return stats
-        except Exception as e:
-            logger.error(f"获取17级地址结构化解析统计失败: {str(e)}")
 
         default_stats = {'total_count': 0}
         for f in fields:
             default_stats[f'{f}_count'] = 0
             default_stats[f'{f}_rate'] = 0
-        return default_stats
+
+        result, total = self._generic_get_statistics(table_name, count_exprs, default_stats)
+        if result is None:
+            return default_stats
+
+        stats = {'total_count': total}
+        for f in fields:
+            count = result[f'{f}_count'] if result else 0
+            stats[f'{f}_count'] = count
+            stats[f'{f}_rate'] = (count / total * 100) if total > 0 else 0
+        return stats
 
     def _build_address_tagging_17_filter_conditions(self, filters):
         """构建17级地址结构化解析结果的筛选条件"""
@@ -1986,19 +1986,13 @@ class DataLoader:
     def export_address_tagging_17_results_batch(self, table_name=None, filters=None, batch_size=5000):
         """批量加载17级地址结构化解析结果用于导出"""
         table_name = table_name or Config.ADDRESS_TAGGING_17_RESULTS_TABLE
-        total = self.get_address_tagging_17_results_count(table_name, filters)
-        if total == 0:
-            return
 
-        offset = 0
-        while offset < total:
-            results = self.get_address_tagging_17_results_paginated(
-                table_name=table_name, filters=filters,
-                page=(offset // batch_size) + 1, page_size=batch_size
-            )
-            if not results.empty:
-                yield results
-            offset += batch_size
+        yield from self._generic_export_batch(
+            table_name, filters, self._build_address_tagging_17_filter_conditions,
+            self.get_address_tagging_17_results_count,
+            self.get_address_tagging_17_results_paginated,
+            batch_size=batch_size
+        )
 
     def create_tagging_17_copy_table(self, source_table, address_col, results, table_suffix='_tagging_17'):
         """
@@ -2025,14 +2019,14 @@ class DataLoader:
             self.db.commit()
 
             for field in self._tagging_17_fields():
-                alter_sql = f"ALTER TABLE {copy_table} ADD COLUMN IF NOT EXISTS {field} VARCHAR(300) DEFAULT ''"
+                alter_sql = f"ALTER TABLE {quote_identifier(copy_table)} ADD COLUMN IF NOT EXISTS {quote_identifier(field)} VARCHAR(300) DEFAULT ''"
                 self.db.execute(alter_sql)
             self.db.commit()
 
             if results:
                 fields = self._tagging_17_fields()
-                set_clause = ', '.join([f"{f} = %s" for f in fields])
-                update_sql = f"UPDATE {copy_table} SET {set_clause} WHERE {address_col} = %s"
+                set_clause = ', '.join([f"{quote_identifier(f)} = %s" for f in fields])
+                update_sql = f"UPDATE {quote_identifier(copy_table)} SET {set_clause} WHERE {quote_identifier(address_col)} = %s"
                 batch_size = 500
                 for i in range(0, len(results), batch_size):
                     batch = results[i:i + batch_size]
@@ -2055,6 +2049,49 @@ class DataLoader:
 
     # ==================== SQL JOIN 方式创建副本表（流式处理用） ====================
 
+    def _ensure_result_table_index(self, result_table):
+        """确保结果表 original_address 上有索引，加速副本表 JOIN 查询"""
+        index_name = f"idx_{result_table}_orig_addr"
+        check_sql = f"""
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = %s AND tablename = %s
+        """
+        try:
+            cursor = self.db.execute(check_sql, (index_name, result_table))
+            if cursor and cursor.fetchone():
+                return  # 索引已存在
+            create_idx_sql = f"""
+                CREATE INDEX {quote_identifier(index_name)}
+                ON {quote_identifier(result_table)} (original_address)
+            """
+            self.db.execute(create_idx_sql)
+            self.db.commit()
+            logger.info(f"已为结果表 {result_table} 创建 original_address 索引")
+        except Exception as e:
+            logger.warning(f"创建结果表索引失败（不影响功能，仅影响副本表创建速度）: {e}")
+
+    def _get_table_row_count(self, table_name):
+        """获取表的行数（使用估算值以避免慢查询）"""
+        try:
+            # pg_class.reltuples 是 ANALYZE 后的估算行数，速度极快
+            sql = """
+                SELECT reltuples::bigint FROM pg_class
+                WHERE relname = %s
+            """
+            cursor = self.db.execute(sql, (table_name,))
+            if cursor:
+                row = cursor.fetchone()
+                if row and row.get('reltuples', 0) > 0:
+                    return row['reltuples']
+            # 估算值不准确时回退到精确计数
+            count_sql = f"SELECT COUNT(*) as cnt FROM {quote_identifier(table_name)}"
+            cursor = self.db.execute(count_sql)
+            if cursor:
+                return cursor.fetchone()['cnt']
+        except Exception:
+            pass
+        return 0
+
     def create_tagging_copy_table_from_result(self, source_table, address_col,
                                                 result_table, table_suffix='_tagging'):
         """
@@ -2062,6 +2099,15 @@ class DataLoader:
 
         适用于流式处理场景：结果已分批写入 result_table，
         直接通过 JOIN 将源表与结果表合并生成副本表。
+
+        设计要点：
+            1. 使用 LEFT JOIN LATERAL ... LIMIT 1 避免源表地址重复时行数膨胀
+               （普通 LEFT JOIN 在源表存在 M 条相同地址、结果表存在 N 条匹配时
+               会产生 M×N 行，导致副本表行数远超源表）
+            2. 保留源表全部字段（s.*），副本表可用于后续业务分析，
+               不只局限于分词结果查看
+            3. 自动创建 original_address 索引加速 JOIN
+            4. 千万级大表也可执行，通过结果表索引保证 JOIN 效率，创建耗时随数据量增长
 
         Args:
             source_table: 原始表名
@@ -2072,26 +2118,48 @@ class DataLoader:
         Returns:
             str: 副本表名，失败返回 None
         """
+        source_count = self._get_table_row_count(source_table)
+        logger.info(
+            f"开始创建12级副本表，源表 {source_table} 约 {source_count:,} 行，"
+            f"结果表 {result_table}，大表创建可能需要较长时间"
+        )
+        start_time = time.time()
+
         copy_table = f"{source_table}{table_suffix}"
         tagging_fields = ['province', 'city', 'district', 'street', 'community',
                           'road', 'roadno', 'area', 'bldg', 'unit', 'floor', 'house']
 
         try:
+            # 确保结果表有索引加速 JOIN
+            self._ensure_result_table_index(result_table)
+
             drop_sql = f"DROP TABLE IF EXISTS {quote_identifier(copy_table)}"
             self.db.execute(drop_sql)
             self.db.commit()
 
-            join_columns = ', '.join([f"r.{f}" for f in tagging_fields])
+            # LATERAL子查询别名用 t，内部结果表别名用 r，避免别名冲突
+            # LIMIT 1 确保源表每行最多匹配结果表一条记录，避免地址重复时行数膨胀
+            r_columns = ', '.join([f"r.{quote_identifier(f)}" for f in tagging_fields])
+            t_columns = ', '.join([f"t.{quote_identifier(f)}" for f in tagging_fields])
             create_sql = f"""
                 CREATE TABLE {quote_identifier(copy_table)} AS
-                SELECT s.*, {join_columns}
+                SELECT s.*, {t_columns}
                 FROM {quote_identifier(source_table)} s
-                LEFT JOIN {quote_identifier(result_table)} r ON s.{quote_identifier(address_col)} = r.original_address
+                LEFT JOIN LATERAL (
+                    SELECT {r_columns}
+                    FROM {quote_identifier(result_table)} r
+                    WHERE r.original_address = s.{quote_identifier(address_col)}
+                    LIMIT 1
+                ) t ON TRUE
             """
             self.db.execute(create_sql)
             self.db.commit()
 
-            logger.info(f"副本表 {copy_table} 通过SQL JOIN创建成功（源表={source_table}, 结果表={result_table})")
+            elapsed = time.time() - start_time
+            logger.info(
+                f"副本表 {copy_table} 通过SQL JOIN创建成功"
+                f"（源表={source_table}, 结果表={result_table}, 耗时 {elapsed:.2f}s）"
+            )
             return copy_table
 
         except Exception as e:
@@ -2106,6 +2174,10 @@ class DataLoader:
         """
         使用 SQL JOIN 从17级结果表创建副本表
 
+        设计要点：使用 LEFT JOIN LATERAL ... LIMIT 1 避免源表地址重复时行数膨胀
+            （普通 LEFT JOIN 在源表存在 M 条相同地址、结果表存在 N 条匹配时
+             会产生 M×N 行，导致副本表行数远超源表）
+
         Args:
             source_table: 原始表名
             address_col: 地址字段名
@@ -2115,26 +2187,47 @@ class DataLoader:
         Returns:
             str: 副本表名，失败返回 None
         """
+        source_count = self._get_table_row_count(source_table)
+        logger.info(
+            f"开始创建17级副本表，源表 {source_table} 约 {source_count:,} 行，"
+            f"结果表 {result_table}，大表创建可能需要较长时间"
+        )
+        start_time = time.time()
+
         copy_table = f"{source_table}{table_suffix}"
         fields = self._tagging_17_fields()
         join_fields = ['_id_field', 'dom_json'] + fields
 
         try:
+            # 确保结果表有索引加速 JOIN
+            self._ensure_result_table_index(result_table)
+
             drop_sql = f"DROP TABLE IF EXISTS {quote_identifier(copy_table)}"
             self.db.execute(drop_sql)
             self.db.commit()
 
-            join_columns = ', '.join([f"r.{f}" for f in join_fields])
+            # LATERAL子查询别名用 t，内部结果表别名用 r，避免别名冲突
+            r_columns = ', '.join([f"r.{quote_identifier(f)}" for f in join_fields])
+            t_columns = ', '.join([f"t.{quote_identifier(f)}" for f in join_fields])
             create_sql = f"""
                 CREATE TABLE {quote_identifier(copy_table)} AS
-                SELECT s.*, {join_columns}
+                SELECT s.*, {t_columns}
                 FROM {quote_identifier(source_table)} s
-                LEFT JOIN {quote_identifier(result_table)} r ON s.{quote_identifier(address_col)} = r.original_address
+                LEFT JOIN LATERAL (
+                    SELECT {r_columns}
+                    FROM {quote_identifier(result_table)} r
+                    WHERE r.original_address = s.{quote_identifier(address_col)}
+                    LIMIT 1
+                ) t ON TRUE
             """
             self.db.execute(create_sql)
             self.db.commit()
 
-            logger.info(f"17级副本表 {copy_table} 通过SQL JOIN创建成功（源表={source_table}, 结果表={result_table})")
+            elapsed = time.time() - start_time
+            logger.info(
+                f"17级副本表 {copy_table} 通过SQL JOIN创建成功"
+                f"（源表={source_table}, 结果表={result_table}, 耗时 {elapsed:.2f}s）"
+            )
             return copy_table
 
         except Exception as e:
@@ -2170,7 +2263,7 @@ class DataLoader:
         table_name = table_name or Config.ADDRESS_TAGGING_17_2_RESULTS_TABLE
 
         sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                 id SERIAL PRIMARY KEY,
                 _id_field TEXT DEFAULT '',
                 dom_json TEXT DEFAULT '',
@@ -2221,11 +2314,7 @@ class DataLoader:
     def truncate_address_tagging_17_2_table(self, table_name=None):
         """清空17级双字段地址结构化解析结果表"""
         table_name = table_name or Config.ADDRESS_TAGGING_17_2_RESULTS_TABLE
-        cursor = self.db.execute(f"TRUNCATE TABLE {table_name}")
-        if cursor:
-            self.db.commit()
-            return True
-        return False
+        return self._generic_truncate_table(table_name, log_label='17级双字段地址结构化解析结果表 ')
 
     def insert_address_tagging_17_2_results(self, results, table_name=None):
         """批量插入17级双字段地址结构化解析结果"""
@@ -2235,7 +2324,7 @@ class DataLoader:
 
         fields = self._tagging_17_2_fields()
         columns = ['_id_field', 'dom_json', 'original_address'] + fields
-        sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES %s"
+        sql = f"INSERT INTO {quote_identifier(table_name)} ({', '.join(quote_identifier(c) for c in columns)}) VALUES %s"
 
         try:
             values = [
@@ -2247,7 +2336,13 @@ class DataLoader:
                 )
                 for r in results
             ]
-            psycopg2.extras.execute_values(self.db.cursor, sql, values, template=None, page_size=1000)
+            cursor = self.db.get_cursor()
+            if not cursor:
+                raise Exception("获取数据库游标失败")
+            try:
+                psycopg2.extras.execute_values(cursor, sql, values, template=None, page_size=1000)
+            finally:
+                cursor.close()
             self.db.commit()
             logger.info(f"已插入 {len(results)} 条17级双字段结果到 {table_name}")
             return len(results)
@@ -2261,46 +2356,17 @@ class DataLoader:
         table_name = table_name or Config.ADDRESS_TAGGING_17_2_RESULTS_TABLE
         self.create_address_tagging_17_2_table(table_name)
 
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
-        params = None
-        if filters:
-            conditions, params = self._build_address_tagging_17_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        try:
-            cursor = self.db.execute(sql, params)
-            if cursor:
-                result = cursor.fetchone()
-                return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f"获取17级双字段结果总数失败: {str(e)}")
-        return 0
+        return self._generic_get_count(table_name, filters, self._build_address_tagging_17_filter_conditions)
 
     def get_address_tagging_17_2_results_paginated(self, table_name=None, filters=None, page=1, page_size=20):
         """分页获取17级双字段解析结果"""
         table_name = table_name or Config.ADDRESS_TAGGING_17_2_RESULTS_TABLE
         self.create_address_tagging_17_2_table(table_name)
 
-        sql = f"SELECT * FROM {table_name}"
-        params = []
-        if filters:
-            conditions, params = self._build_address_tagging_17_filter_conditions(filters)
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-        sql += " ORDER BY id"
-        offset = (page - 1) * page_size
-        sql += f" LIMIT {page_size} OFFSET {offset}"
-
-        try:
-            cursor = self.db.execute(sql, params if params else None)
-            if cursor:
-                rows = cursor.fetchall()
-                return pd.DataFrame(rows)
-        except Exception as e:
-            logger.error(f"分页获取17级双字段结果失败: {str(e)}")
-        return pd.DataFrame()
+        return self._generic_get_paginated(
+            table_name, filters, self._build_address_tagging_17_filter_conditions,
+            page=page, page_size=page_size, order_by='id'
+        )
 
     def get_address_tagging_17_2_statistics(self, table_name=None):
         """获取17级双字段解析统计信息"""
@@ -2310,53 +2376,45 @@ class DataLoader:
         base_fields = self._tagging_17_fields()
         # 统计主字段有值的比例（不含_2字段）
         count_exprs = ', '.join([
-            f"SUM(CASE WHEN {f} IS NOT NULL AND {f} != '' THEN 1 ELSE 0 END) as {f}_count"
+            f"SUM(CASE WHEN {quote_identifier(f)} IS NOT NULL AND {quote_identifier(f)} != '' THEN 1 ELSE 0 END) as {f}_count"
             for f in base_fields
         ])
-
-        sql = f"SELECT COUNT(*) as total_count, {count_exprs} FROM {table_name}"
-
-        try:
-            cursor = self.db.execute(sql)
-            if cursor:
-                result = cursor.fetchone()
-                total = result['total_count'] if result else 0
-                stats = {'total_count': total}
-                for f in base_fields:
-                    count = result[f'{f}_count'] if result else 0
-                    stats[f'{f}_count'] = count
-                    stats[f'{f}_rate'] = (count / total * 100) if total > 0 else 0
-                return stats
-        except Exception as e:
-            logger.error(f"获取17级双字段统计失败: {str(e)}")
 
         default_stats = {'total_count': 0}
         for f in base_fields:
             default_stats[f'{f}_count'] = 0
             default_stats[f'{f}_rate'] = 0
-        return default_stats
+
+        result, total = self._generic_get_statistics(table_name, count_exprs, default_stats)
+        if result is None:
+            return default_stats
+
+        stats = {'total_count': total}
+        for f in base_fields:
+            count = result[f'{f}_count'] if result else 0
+            stats[f'{f}_count'] = count
+            stats[f'{f}_rate'] = (count / total * 100) if total > 0 else 0
+        return stats
 
     def export_address_tagging_17_2_results_batch(self, table_name=None, filters=None, batch_size=5000):
         """批量加载17级双字段解析结果用于导出"""
         table_name = table_name or Config.ADDRESS_TAGGING_17_2_RESULTS_TABLE
-        total = self.get_address_tagging_17_2_results_count(table_name, filters)
-        if total == 0:
-            return
 
-        offset = 0
-        while offset < total:
-            results = self.get_address_tagging_17_2_results_paginated(
-                table_name=table_name, filters=filters,
-                page=(offset // batch_size) + 1, page_size=batch_size
-            )
-            if not results.empty:
-                yield results
-            offset += batch_size
+        yield from self._generic_export_batch(
+            table_name, filters, self._build_address_tagging_17_filter_conditions,
+            self.get_address_tagging_17_2_results_count,
+            self.get_address_tagging_17_2_results_paginated,
+            batch_size=batch_size
+        )
 
     def create_tagging_17_2_copy_table_from_result(self, source_table, address_col,
                                                      result_table, table_suffix='_tagging_17_2'):
         """
         使用 SQL JOIN 从17级双字段结果表创建副本表
+
+        设计要点：使用 LEFT JOIN LATERAL ... LIMIT 1 避免源表地址重复时行数膨胀
+            （普通 LEFT JOIN 在源表存在 M 条相同地址、结果表存在 N 条匹配时
+             会产生 M×N 行，导致副本表行数远超源表）
 
         Args:
             source_table: 原始表名
@@ -2367,26 +2425,46 @@ class DataLoader:
         Returns:
             str: 副本表名，失败返回 None
         """
+        source_count = self._get_table_row_count(source_table)
+        logger.info(
+            f"开始创建17级双字段副本表，源表 {source_table} 约 {source_count:,} 行，"
+            f"结果表 {result_table}，大表创建可能需要较长时间"
+        )
+        start_time = time.time()
+
         copy_table = f"{source_table}{table_suffix}"
         fields = self._tagging_17_2_fields()
         join_fields = ['_id_field', 'dom_json'] + fields
 
         try:
+            # 确保结果表有索引加速 JOIN
+            self._ensure_result_table_index(result_table)
+
             drop_sql = f"DROP TABLE IF EXISTS {quote_identifier(copy_table)}"
             self.db.execute(drop_sql)
             self.db.commit()
 
-            join_columns = ', '.join([f"r.{f}" for f in join_fields])
+            # LATERAL子查询别名用 t，内部结果表别名用 r，避免别名冲突
+            r_columns = ', '.join([f"r.{quote_identifier(f)}" for f in join_fields])
+            t_columns = ', '.join([f"t.{quote_identifier(f)}" for f in join_fields])
             create_sql = f"""
                 CREATE TABLE {quote_identifier(copy_table)} AS
-                SELECT s.*, {join_columns}
+                SELECT s.*, {t_columns}
                 FROM {quote_identifier(source_table)} s
-                LEFT JOIN {quote_identifier(result_table)} r ON s.{quote_identifier(address_col)} = r.original_address
+                LEFT JOIN LATERAL (
+                    SELECT {r_columns}
+                    FROM {quote_identifier(result_table)} r
+                    WHERE r.original_address = s.{quote_identifier(address_col)}
+                    LIMIT 1
+                ) t ON TRUE
             """
             self.db.execute(create_sql)
             self.db.commit()
 
-            logger.info(f"17级双字段副本表 {copy_table} 通过SQL JOIN创建成功")
+            elapsed = time.time() - start_time
+            logger.info(
+                f"17级双字段副本表 {copy_table} 通过SQL JOIN创建成功（耗时 {elapsed:.2f}s）"
+            )
             return copy_table
 
         except Exception as e:
@@ -2414,7 +2492,7 @@ class DataLoader:
         enterprise_ids = [str(eid) for eid in enterprise_ids]
         placeholders = ','.join(['%s'] * len(enterprise_ids))
         sql = f"""
-            SELECT * FROM {table_name}
+            SELECT * FROM {quote_identifier(table_name)}
             WHERE enterprise_id IN ({placeholders})
             ORDER BY enterprise_id, similarity DESC
         """
@@ -2443,7 +2521,7 @@ class DataLoader:
         """
         table_name = table_name or Config.RESULT_TABLE
         sql = f"""
-            UPDATE {table_name}
+            UPDATE {quote_identifier(table_name)}
             SET address_id = %s,
                 standard_address = %s,
                 room_no = %s,
@@ -2533,7 +2611,7 @@ class DataLoader:
 
         params.append(str(enterprise_id))
 
-        sql = f"UPDATE {table_name} SET {', '.join(set_clauses)} WHERE enterprise_id = %s"
+        sql = f"UPDATE {quote_identifier(table_name)} SET {', '.join(set_clauses)} WHERE enterprise_id = %s"
         try:
             cursor = self.db.execute(sql, tuple(params))
             if cursor:
@@ -2604,10 +2682,7 @@ class DataLoader:
 
         self.create_result_table(table_name)
 
-        sql = f"""
-            SELECT 
-                COUNT(*) as total_count,
-                SUM(CASE WHEN match_status = '精确匹配' THEN 1 ELSE 0 END) as exact_match_count,
+        count_exprs = """SUM(CASE WHEN match_status = '精确匹配' THEN 1 ELSE 0 END) as exact_match_count,
                 SUM(CASE WHEN match_status = '部分匹配' THEN 1 ELSE 0 END) as partial_match_count,
                 SUM(CASE WHEN match_status = '不匹配' THEN 1 ELSE 0 END) as not_match_count,
                 AVG(exact_match) as avg_exact_match,
@@ -2616,59 +2691,45 @@ class DataLoader:
                 SUM(CASE WHEN correction_source IN ('人工纠正', '人工匹配') THEN 1 ELSE 0 END) as manual_correction_count,
                 SUM(CASE WHEN correction_source = '人工纠正' THEN 1 ELSE 0 END) as manual_select_count,
                 SUM(CASE WHEN correction_source = '人工匹配' THEN 1 ELSE 0 END) as manual_match_count,
-                SUM(CASE WHEN correction_source = '自动匹配' OR correction_source IS NULL THEN 1 ELSE 0 END) as auto_match_count
-            FROM {table_name}
-        """
+                SUM(CASE WHEN correction_source = '自动匹配' OR correction_source IS NULL THEN 1 ELSE 0 END) as auto_match_count"""
 
-        try:
-            cursor = self.db.execute(sql)
-            if cursor:
-                result = cursor.fetchone()
-                total = result['total_count'] if result else 0
-                exact_count = result['exact_match_count'] if result else 0
-                partial_count = result['partial_match_count'] if result else 0
-                not_count = result['not_match_count'] if result else 0
-                manual_count = result['manual_correction_count'] if result else 0
-                manual_select_count = result['manual_select_count'] if result else 0
-                manual_match_count = result['manual_match_count'] if result else 0
-                auto_count = result['auto_match_count'] if result else 0
-                return {
-                    'total_count': total,
-                    'exact_match_count': exact_count,
-                    'partial_match_count': partial_count,
-                    'not_match_count': not_count,
-                    'match_rate': ((exact_count + partial_count) / total * 100) if total > 0 else 0,
-                    'exact_match_rate': (exact_count / total * 100) if total > 0 else 0,
-                    'partial_match_rate': (partial_count / total * 100) if total > 0 else 0,
-                    'not_match_rate': (not_count / total * 100) if total > 0 else 0,
-                    'avg_exact_match': float(result['avg_exact_match']) if result and result['avg_exact_match'] else 0.0,
-                    'avg_partial_match': float(result['avg_partial_match']) if result and result['avg_partial_match'] else 0.0,
-                    'avg_not_match': float(result['avg_not_match']) if result and result['avg_not_match'] else 0.0,
-                    'manual_correction_count': manual_count,
-                    'manual_select_count': manual_select_count,
-                    'manual_match_count': manual_match_count,
-                    'auto_match_count': auto_count,
-                    'manual_correction_rate': (manual_count / total * 100) if total > 0 else 0
-                }
-        except Exception as e:
-            logger.error(f"Failed to get match statistics: {str(e)}")
+        default_stats = {
+            'total_count': 0, 'exact_match_count': 0, 'partial_match_count': 0,
+            'not_match_count': 0, 'match_rate': 0, 'exact_match_rate': 0,
+            'partial_match_rate': 0, 'not_match_rate': 0,
+            'avg_exact_match': 0.0, 'avg_partial_match': 0.0, 'avg_not_match': 0.0,
+            'manual_correction_count': 0, 'manual_select_count': 0,
+            'manual_match_count': 0, 'auto_match_count': 0, 'manual_correction_rate': 0
+        }
+
+        result, total = self._generic_get_statistics(table_name, count_exprs, default_stats)
+        if result is None:
+            return default_stats
+
+        exact_count = result['exact_match_count'] if result else 0
+        partial_count = result['partial_match_count'] if result else 0
+        not_count = result['not_match_count'] if result else 0
+        manual_count = result['manual_correction_count'] if result else 0
+        manual_select_count = result['manual_select_count'] if result else 0
+        manual_match_count = result['manual_match_count'] if result else 0
+        auto_count = result['auto_match_count'] if result else 0
         return {
-            'total_count': 0,
-            'exact_match_count': 0,
-            'partial_match_count': 0,
-            'not_match_count': 0,
-            'match_rate': 0,
-            'exact_match_rate': 0,
-            'partial_match_rate': 0,
-            'not_match_rate': 0,
-            'avg_exact_match': 0.0,
-            'avg_partial_match': 0.0,
-            'avg_not_match': 0.0,
-            'manual_correction_count': 0,
-            'manual_select_count': 0,
-            'manual_match_count': 0,
-            'auto_match_count': 0,
-            'manual_correction_rate': 0
+            'total_count': total,
+            'exact_match_count': exact_count,
+            'partial_match_count': partial_count,
+            'not_match_count': not_count,
+            'match_rate': ((exact_count + partial_count) / total * 100) if total > 0 else 0,
+            'exact_match_rate': (exact_count / total * 100) if total > 0 else 0,
+            'partial_match_rate': (partial_count / total * 100) if total > 0 else 0,
+            'not_match_rate': (not_count / total * 100) if total > 0 else 0,
+            'avg_exact_match': float(result['avg_exact_match']) if result and result['avg_exact_match'] else 0.0,
+            'avg_partial_match': float(result['avg_partial_match']) if result and result['avg_partial_match'] else 0.0,
+            'avg_not_match': float(result['avg_not_match']) if result and result['avg_not_match'] else 0.0,
+            'manual_correction_count': manual_count,
+            'manual_select_count': manual_select_count,
+            'manual_match_count': manual_match_count,
+            'auto_match_count': auto_count,
+            'manual_correction_rate': (manual_count / total * 100) if total > 0 else 0
         }
 
     def _build_mgeo_similarity_filter_conditions(self, filters):
@@ -2719,9 +2780,14 @@ class DataLoader:
 
         return conditions, params
 
-    def create_mgeo_copy_table(self, source_table, address_a_col, address_b_col, results, table_suffix='_mgeo'):
+    def create_mgeo_copy_table(self, source_table, address_a_col, address_b_col,
+                                results=None, table_suffix='_mgeo', result_table=None):
         """
         基于原始表创建_mgeo副本表，包含原始数据及exact_match、partial_match、not_match三个匹配字段
+
+        支持两种模式：
+            1. 传入 result_table（推荐）：通过结果表 JOIN 更新，支持千万级数据，不占用Python内存
+            2. 传入 results 列表：通过 VALUES UPDATE，适用于文件输入场景（数据量较小）
 
         流程：复制原始表全部数据 → 添加匹配字段 → 批量UPDATE匹配结果
 
@@ -2729,8 +2795,9 @@ class DataLoader:
             source_table: 原始表名
             address_a_col: 地址A字段名
             address_b_col: 地址B字段名
-            results: 匹配结果列表，每个元素包含 address_a, address_b, exact_match, partial_match, not_match, match_status
+            results: 匹配结果列表（文件输入场景使用）
             table_suffix: 副本表后缀，默认 '_mgeo'
+            result_table: 结果表名（数据库输入场景使用，优先于results）
 
         Returns:
             str: 创建的副本表名，失败返回 None
@@ -2746,7 +2813,12 @@ class DataLoader:
             self.db.execute(drop_sql)
             self.db.commit()
 
-            create_sql = f"CREATE TABLE {q_copy} AS SELECT * FROM {q_source}"
+            # 添加行号列用于精确匹配，避免地址文本重复导致错误更新
+            create_sql = f"""
+                CREATE TABLE {q_copy} AS
+                SELECT ROW_NUMBER() OVER () AS __row_id, *
+                FROM {q_source}
+            """
             self.db.execute(create_sql)
             self.db.commit()
 
@@ -2760,7 +2832,26 @@ class DataLoader:
                 self.db.execute(alter_sql)
             self.db.commit()
 
-            if results:
+            # 模式1：通过结果表 JOIN 更新（推荐，支持千万级数据）
+            if result_table:
+                q_result = quote_identifier(result_table)
+                # 先给结果表添加行号列（按address_a, address_b排序与源表行号对齐）
+                # 使用源表的行号来关联，确保一一对应
+                update_sql = f"""
+                    UPDATE {q_copy} AS c SET
+                        exact_match = r.exact_match,
+                        partial_match = r.partial_match,
+                        not_match = r.not_match,
+                        match_status = r.match_status
+                    FROM {q_result} AS r
+                    WHERE c.{q_addr_a} = r.address_a AND c.{q_addr_b} = r.address_b
+                """
+                self.db.execute(update_sql)
+                self.db.commit()
+                logger.info(f"MGeo copy table {copy_table} updated from result table {result_table}")
+
+            # 模式2：通过 results 列表 VALUES UPDATE（文件输入场景）
+            elif results:
                 update_sql = f"""
                     UPDATE {q_copy} AS c SET
                         exact_match = v.exact_match,
@@ -2778,13 +2869,19 @@ class DataLoader:
                      r['match_status'])
                     for r in results
                 ]
-                psycopg2.extras.execute_values(
-                    self.db.cursor, update_sql, values, template=None, page_size=5000
-                )
+                cursor = self.db.get_cursor()
+                if not cursor:
+                    raise Exception("获取数据库游标失败")
+                try:
+                    psycopg2.extras.execute_values(
+                        cursor, update_sql, values, template=None, page_size=5000
+                    )
+                finally:
+                    cursor.close()
                 self.db.commit()
                 logger.info(f"MGeo copy table {copy_table} batch-updated with {len(results)} results")
 
-            logger.info(f"MGeo copy table {copy_table} created successfully with {len(results)} match results")
+            logger.info(f"MGeo copy table {copy_table} created successfully")
             return copy_table
 
         except Exception as e:
@@ -2797,30 +2894,21 @@ class DataLoader:
     def export_match_results_batch(self, table_name=None, filters=None, batch_size=5000):
         """
         批量加载匹配结果用于导出（避免一次性加载导致内存溢出）
-        
+
         Args:
             table_name: 表名，默认使用 Config.RESULT_TABLE
             filters: 过滤条件字典
             batch_size: 每批加载的记录数
-        
+
         Yields:
             DataFrame: 每批匹配结果数据帧
         """
         table_name = table_name or Config.RESULT_TABLE
         self.create_result_table(table_name)
-        
-        total = self.get_match_results_count(table_name, filters)
-        if total == 0:
-            return
-        
-        offset = 0
-        while offset < total:
-            results = self.get_match_results_paginated(
-                table_name=table_name,
-                filters=filters,
-                page=(offset // batch_size) + 1,
-                page_size=batch_size
-            )
-            if not results.empty:
-                yield results
-            offset += batch_size
+
+        yield from self._generic_export_batch(
+            table_name, filters, self._build_filter_conditions,
+            self.get_match_results_count,
+            self.get_match_results_paginated,
+            batch_size=batch_size
+        )

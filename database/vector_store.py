@@ -22,6 +22,7 @@ import psycopg2
 import psycopg2.extras
 import pgvector.psycopg2
 from config import Config
+from database.connection import quote_identifier
 from utils.logger import logger
 
 class VectorStore:
@@ -64,7 +65,7 @@ class VectorStore:
         
         if table_type == 'enterprise':
             sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                     id SERIAL PRIMARY KEY,
                     source_id VARCHAR(255) NOT NULL,
                     enterprise_name TEXT,
@@ -75,7 +76,7 @@ class VectorStore:
             """
         else:
             sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                     id SERIAL PRIMARY KEY,
                     source_id VARCHAR(255) NOT NULL,
                     address TEXT NOT NULL,
@@ -106,7 +107,7 @@ class VectorStore:
         """
         if table_type == 'enterprise':
             sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                     id SERIAL PRIMARY KEY,
                     source_id VARCHAR(255) NOT NULL,
                     enterprise_name TEXT,
@@ -117,7 +118,7 @@ class VectorStore:
             """
         else:
             sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {quote_identifier(table_name)} (
                     id SERIAL PRIMARY KEY,
                     source_id VARCHAR(255) NOT NULL,
                     address TEXT NOT NULL,
@@ -164,24 +165,76 @@ class VectorStore:
             logger.warning(f"检测索引类型失败 {table_name}: {e}")
         return 'none'
 
-    def _set_index_search_param(self, table_name, top_n):
+    def get_recommended_ef_search(self, table_name, top_n=10):
+        """
+        根据标准地址向量表的索引类型和数据量，计算推荐的 ef_search 默认值。
+
+        仅 HNSW 索引有意义；IVFFlat / 无索引返回 None。
+
+        推荐规则（兼顾召回质量与查询性能）：
+            - 行数 < 10万   : 64
+            - 行数 < 100万  : 128
+            - 行数 < 1000万 : 256
+            - 行数 >= 1000万: 512
+        最终结果不低于 top_n（HNSW 要求 ef_search >= top_n）。
+
+        Args:
+            table_name: 标准地址向量表名
+            top_n: 粗召回数量，用于保证 ef_search >= top_n
+
+        Returns:
+            int or None: 推荐 ef_search 值；非 HNSW 索引返回 None
+        """
+        try:
+            index_type = self._detect_vector_index_type(table_name)
+            if index_type != 'hnsw':
+                return None
+
+            row_count = self.get_vector_count(table_name)
+
+            if row_count < 100_000:
+                base = 64
+            elif row_count < 1_000_000:
+                base = 128
+            elif row_count < 10_000_000:
+                base = 256
+            else:
+                base = 512
+
+            # HNSW 要求 ef_search >= top_n，否则会抛错或截断结果
+            recommended = max(base, int(top_n))
+            logger.info(f"Recommended ef_search={recommended} for {table_name} "
+                        f"(rows={row_count}, top_n={top_n}, base={base})")
+            return recommended
+        except Exception as e:
+            logger.warning(f"计算推荐 ef_search 失败 {table_name}: {e}")
+            return None
+
+    def _set_index_search_param(self, table_name, top_n, ef_search=None):
         """
         根据表的向量索引类型，设置对应的查询参数以确保召回数量充足
 
-        HNSW 索引：设置 hnsw.ef_search >= top_n（默认值128，当 top_n > 128 时必须调大）
+        HNSW 索引：设置 hnsw.ef_search
+            - 若显式传入 ef_search，则使用传入值（需 >= top_n）
+            - 否则使用 max(top_n, 128) 作为兜底默认值
         IVFFlat 索引：设置 ivfflat.probes（默认值1，建议设为 sqrt(lists) 以提高召回率）
         无索引：不设置
 
         Args:
             table_name: 表名
             top_n: 期望召回的数量
+            ef_search: 用户指定的 hnsw.ef_search 值，None 时使用默认计算逻辑
         """
         index_type = self._detect_vector_index_type(table_name)
 
         if index_type == 'hnsw':
-            ef_search = max(top_n, 128)
-            self.db.execute(f"SET hnsw.ef_search = {ef_search}")
-            logger.info(f"SET hnsw.ef_search = {ef_search} (top_n={top_n})")
+            # 优先使用用户指定的 ef_search，但必须不小于 top_n（HNSW 硬性要求）
+            if ef_search is not None:
+                final_ef = max(int(ef_search), int(top_n))
+            else:
+                final_ef = max(top_n, 128)
+            self.db.execute(f"SET hnsw.ef_search = {final_ef}")
+            logger.info(f"SET hnsw.ef_search = {final_ef} (top_n={top_n}, user_ef_search={ef_search})")
         elif index_type == 'ivfflat':
             try:
                 idx_sql = """
@@ -242,7 +295,7 @@ class VectorStore:
         Returns:
             bool: 删除成功返回 True
         """
-        sql = f"DROP INDEX IF EXISTS {index_name}"
+        sql = f"DROP INDEX IF EXISTS {quote_identifier(index_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             self.db.commit()
@@ -311,15 +364,15 @@ class VectorStore:
             # 构建创建索引 SQL
             if index_type == 'ivfflat':
                 sql = f"""
-                    CREATE INDEX {index_name}
-                    ON {table_name}
+                    CREATE INDEX {quote_identifier(index_name)}
+                    ON {quote_identifier(table_name)}
                     USING ivfflat (vector vector_l2_ops)
                     WITH (lists = {lists})
                 """
             elif index_type == 'hnsw':
                 sql = f"""
-                    CREATE INDEX {index_name}
-                    ON {table_name}
+                    CREATE INDEX {quote_identifier(index_name)}
+                    ON {quote_identifier(table_name)}
                     USING hnsw (vector vector_l2_ops)
                     WITH (m = {m}, ef_construction = {ef_construction})
                 """
@@ -411,13 +464,13 @@ class VectorStore:
 
         if table_type == 'enterprise':
             sql = f"""
-                INSERT INTO {table_name} (source_id, enterprise_name, address, vector)
+                INSERT INTO {quote_identifier(table_name)} (source_id, enterprise_name, address, vector)
                 VALUES %s
             """
             template = f"(%s, %s, %s, %s::vector({actual_dim}))"
         else:
             sql = f"""
-                INSERT INTO {table_name} (source_id, address, room_no, vector)
+                INSERT INTO {quote_identifier(table_name)} (source_id, address, room_no, vector)
                 VALUES %s
             """
             template = f"(%s, %s, %s, %s::vector({actual_dim}))"
@@ -427,6 +480,12 @@ class VectorStore:
         self.db.conn.autocommit = False
         inserted_count = 0
         total_chunks = (total + insert_chunk_size - 1) // insert_chunk_size
+
+        # 获取独立 cursor，避免共享 cursor 线程安全隐患
+        insert_cursor = self.db.get_cursor()
+        if not insert_cursor:
+            self.db.conn.autocommit = was_autocommit
+            raise Exception("获取数据库游标失败")
 
         try:
             for chunk_idx, chunk_start in enumerate(range(0, total, insert_chunk_size)):
@@ -444,7 +503,7 @@ class VectorStore:
                         values.append((source_ids[idx], addresses[idx], room_no, vec_strs[i]))
 
                 psycopg2.extras.execute_values(
-                    self.db.cursor, sql, values, template=template, page_size=1000
+                    insert_cursor, sql, values, template=template, page_size=1000
                 )
                 inserted_count += len(values)
 
@@ -470,6 +529,11 @@ class VectorStore:
                 pass
             return 0
         finally:
+            # 关闭独立 cursor
+            try:
+                insert_cursor.close()
+            except Exception:
+                pass
             # 恢复 autocommit 前必须先结束当前事务，否则 psycopg2 报错
             try:
                 self.db.conn.commit()
@@ -490,9 +554,14 @@ class VectorStore:
         """
         try:
             for source_id in sample_ids:
+                # 使用 pgvector 内积操作符 <#> 验证向量自身内积。
+                # <#> 返回负内积，因此取负值后得到正值内积；
+                # 归一化向量期望自身内积≈1.0。
+                # 原 SQL 存在两个 %s 占位符但只传入一个参数，导致
+                # "tuple index out of range" 错误，现改为仅按 source_id 查询。
                 sql = f"""
-                    SELECT source_id, address, 1 - ((vector <-> vector)^2 / 2.0) as self_inner_product
-                    FROM {table_name}
+                    SELECT source_id, address, -(vector <#> vector) as self_inner_product
+                    FROM {quote_identifier(table_name)}
                     WHERE source_id = %s
                 """
                 cursor = self.db.execute(sql, (source_id,))
@@ -530,12 +599,12 @@ class VectorStore:
         """
         table_name = table_name or self.table_name
         query_vector = np.array(query_vector)
-        
-        self._set_index_search_param(table_name, top_n)
+
+        self._set_index_search_param(table_name, top_n, ef_search=None)
 
         sql = f"""
             SELECT source_id, address, 1 - ((vector <-> %s) ^ 2) / 2.0 as similarity
-            FROM {table_name}
+            FROM {quote_identifier(table_name)}
             ORDER BY vector <-> %s
             LIMIT %s
         """
@@ -553,27 +622,28 @@ class VectorStore:
             ]
         return []
     
-    def batch_recall(self, enterprise_table, standard_table, top_n=10, similarity_threshold=None):
+    def batch_recall(self, enterprise_table, standard_table, top_n=10, similarity_threshold=None, ef_search=None):
         """
         批量召回 - 为每个企业检索最相似的标准地址候选
-        
+
         阶段1（粗召回）的核心方法，使用 SQL JOIN LATERAL 实现高效的批量向量相似性检索。
         使用 L2 距离（欧氏距离）排序召回，通过公式转换为余弦相似度：
         similarity = 1 - (L2_distance^2 / 2)，归一化向量 L2 距离范围为 [0, 2]，
         对应余弦相似度范围为 [0, 1]。
-        
+
         Args:
             enterprise_table: 企业向量表名
             standard_table: 标准地址向量表名
             top_n: 每个企业召回的候选数量
             similarity_threshold: 相似度阈值（0-1），低于此阈值的候选将被过滤，None表示不过滤
-        
+            ef_search: HNSW 索引的 ef_search 参数，None 时使用默认计算逻辑
+
         Returns:
             list: 召回结果列表，每个元素包含企业信息和候选地址列表
         """
-        logger.info(f"Starting batch recall from {enterprise_table} to {standard_table}, top_n={top_n}, threshold={similarity_threshold}")
-        
-        self._set_index_search_param(standard_table, top_n)
+        logger.info(f"Starting batch recall from {enterprise_table} to {standard_table}, top_n={top_n}, threshold={similarity_threshold}, ef_search={ef_search}")
+
+        self._set_index_search_param(standard_table, top_n, ef_search=ef_search)
 
         threshold_condition = ""
         if similarity_threshold is not None:
@@ -588,14 +658,14 @@ class VectorStore:
                 a.address AS standard_address,
                 a.room_no,
                 1 - ((c.vector <-> a.vector) ^ 2) / 2.0 AS similarity
-            FROM {enterprise_table} c
+            FROM {quote_identifier(enterprise_table)} c
             JOIN LATERAL (
                 SELECT
                     source_id,
                     address,
                     room_no,
                     vector
-                FROM {standard_table}
+                FROM {quote_identifier(standard_table)}
                 ORDER BY c.vector <-> vector
                 LIMIT {top_n}
             ) a ON true
@@ -635,7 +705,122 @@ class VectorStore:
         
         logger.info(f"✅ 批量召回完成，为 {len(grouped_results)} 家企业找到候选地址")
         return list(grouped_results.values())
-    
+
+    def batch_recall_streaming(self, enterprise_table, standard_table, top_n=10,
+                               similarity_threshold=None, ef_search=None,
+                               batch_enterprise_size=5000):
+        """
+        流式批量召回 - 使用 PostgreSQL 服务端游标分批产出，避免全量 fetchall OOM
+
+        适用场景：企业数巨大（如 150 万）时，batch_recall 的全量 fetchall 会导致 OOM。
+        本方法使用 named cursor（服务端游标）逐批拉取，每批 batch_enterprise_size 家企业，
+        调用方边拉取边处理（送精排、写库），全程不累积全量数据。
+
+        Args:
+            enterprise_table: 企业向量表名
+            standard_table: 标准地址向量表名
+            top_n: 每个企业召回的候选数量
+            similarity_threshold: 相似度阈值（0-1），低于此阈值的候选将被过滤，None 表示不过滤
+            ef_search: HNSW 索引的 ef_search 参数，None 时使用默认计算逻辑
+            batch_enterprise_size: 每批 yield 的最大企业数量，控制内存占用上限
+
+        Yields:
+            list: 每批召回结果（已按企业分组），结构同 batch_recall 返回值
+        """
+        logger.info(f"Starting streaming batch recall from {enterprise_table} to {standard_table}, "
+                    f"top_n={top_n}, threshold={similarity_threshold}, ef_search={ef_search}, "
+                    f"batch_enterprise_size={batch_enterprise_size}")
+
+        self._set_index_search_param(standard_table, top_n, ef_search=ef_search)
+
+        # top_n 在 Python 层校验后拼接（LATERAL 内 LIMIT 不支持参数化占位符）
+        if not isinstance(top_n, int) or top_n <= 0 or top_n > 1000:
+            raise ValueError(f"top_n 必须是 1-1000 的整数，当前: {top_n}")
+
+        threshold_condition = ""
+        if similarity_threshold is not None:
+            # 阈值已转 float，安全拼接
+            threshold_condition = f"WHERE 1 - ((c.vector <-> a.vector) ^ 2) / 2.0 >= {float(similarity_threshold)}"
+
+        sql = f"""
+            SELECT
+                c.source_id AS enterprise_id,
+                c.enterprise_name,
+                c.address AS enterprise_address,
+                a.source_id AS standard_id,
+                a.address AS standard_address,
+                a.room_no,
+                1 - ((c.vector <-> a.vector) ^ 2) / 2.0 AS similarity
+            FROM {quote_identifier(enterprise_table)} c
+            JOIN LATERAL (
+                SELECT source_id, address, room_no, vector
+                FROM {quote_identifier(standard_table)}
+                ORDER BY c.vector <-> vector
+                LIMIT {top_n}
+            ) a ON true
+            {threshold_condition}
+            ORDER BY c.source_id, similarity DESC
+        """
+
+        conn = self.db.conn
+        if conn is None:
+            logger.error("数据库连接未建立，无法执行流式召回")
+            return
+
+        # named cursor 必须在事务内运行，临时关闭 autocommit
+        old_autocommit = conn.autocommit
+        conn.autocommit = False
+        # 使用唯一游标名避免并发冲突
+        import threading as _th
+        cursor_name = f'recall_stream_{id(self)}_{_th.get_ident()}'
+        try:
+            with conn.cursor(name=cursor_name, cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # itersize 控制服务端每次 fetch 的行数，按预估行数设置
+                cur.itersize = max(batch_enterprise_size * top_n, 1000)
+                cur.execute(sql)
+
+                batch = []
+                current_eid = None
+                current_item = None
+
+                for row in cur:  # 逐行迭代，服务端游标自动分批拉取
+                    eid = row['enterprise_id']
+                    if current_eid != eid:
+                        # 新企业开始
+                        if current_item is not None:
+                            batch.append(current_item)
+                            # 达到批次大小则 yield
+                            if len(batch) >= batch_enterprise_size:
+                                yield batch
+                                batch = []
+                        current_eid = eid
+                        current_item = {
+                            'enterprise_id': eid,
+                            'enterprise_name': row['enterprise_name'],
+                            'enterprise_address': row['enterprise_address'],
+                            'candidates': []
+                        }
+                    current_item['candidates'].append({
+                        'source_id': row['standard_id'],
+                        'address': row['standard_address'],
+                        'room_no': row['room_no'],
+                        'similarity': row['similarity']
+                    })
+
+                # 处理最后一个企业和剩余批次
+                if current_item is not None:
+                    batch.append(current_item)
+                if batch:
+                    yield batch
+        finally:
+            # 恢复 autocommit 状态
+            try:
+                conn.autocommit = old_autocommit
+            except Exception:
+                pass
+
+        logger.info("✅ 流式批量召回完成")
+
     def get_vector_count(self, table_name=None):
         """
         获取向量表记录数
@@ -647,7 +832,7 @@ class VectorStore:
             int: 记录数
         """
         table_name = table_name or self.table_name
-        sql = f"SELECT COUNT(*) as count FROM {table_name}"
+        sql = f"SELECT COUNT(*) as count FROM {quote_identifier(table_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             result = cursor.fetchone()
@@ -665,7 +850,7 @@ class VectorStore:
             bool: 删除成功返回 True
         """
         table_name = table_name or self.table_name
-        sql = f"DROP TABLE IF EXISTS {table_name}"
+        sql = f"DROP TABLE IF EXISTS {quote_identifier(table_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             self.db.commit()
@@ -684,7 +869,7 @@ class VectorStore:
             bool: 清空成功返回 True
         """
         table_name = table_name or self.table_name
-        sql = f"TRUNCATE TABLE {table_name}"
+        sql = f"TRUNCATE TABLE {quote_identifier(table_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             self.db.commit()
@@ -724,7 +909,7 @@ class VectorStore:
         Returns:
             bool: 重命名成功返回 True
         """
-        sql = f"ALTER TABLE {old_name} RENAME TO {new_name}"
+        sql = f"ALTER TABLE {quote_identifier(old_name)} RENAME TO {quote_identifier(new_name)}"
         cursor = self.db.execute(sql)
         if cursor:
             self.db.commit()
@@ -841,7 +1026,7 @@ class VectorStore:
 
             # 最早创建时间
             time_sql = f"""
-                SELECT MIN(created_at) as created_at FROM {table_name}
+                SELECT MIN(created_at) as created_at FROM {quote_identifier(table_name)}
             """
             cursor = self.db.execute(time_sql)
             created_at = cursor.fetchone()['created_at'] if cursor else None
@@ -869,7 +1054,7 @@ class VectorStore:
         Returns:
             bool: 成功返回 True
         """
-        sql = f"ALTER TABLE {table_name} SET (autovacuum_enabled = false)"
+        sql = f"ALTER TABLE {quote_identifier(table_name)} SET (autovacuum_enabled = false)"
         cursor = self.db.execute(sql)
         if cursor:
             logger.info(f"Autovacuum 已禁用: {table_name}")
@@ -886,7 +1071,7 @@ class VectorStore:
         Returns:
             bool: 成功返回 True
         """
-        sql = f"ALTER TABLE {table_name} SET (autovacuum_enabled = true)"
+        sql = f"ALTER TABLE {quote_identifier(table_name)} SET (autovacuum_enabled = true)"
         cursor = self.db.execute(sql)
         if cursor:
             logger.info(f"Autovacuum 已恢复: {table_name}")
@@ -906,9 +1091,9 @@ class VectorStore:
             bool: 成功返回 True
         """
         if analyze:
-            sql = f"VACUUM ANALYZE {table_name}"
+            sql = f"VACUUM ANALYZE {quote_identifier(table_name)}"
         else:
-            sql = f"VACUUM {table_name}"
+            sql = f"VACUUM {quote_identifier(table_name)}"
 
         was_autocommit = self.db.conn.autocommit
         self.db.conn.autocommit = True

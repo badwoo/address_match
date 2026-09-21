@@ -29,29 +29,27 @@ import time
 import os
 from config import Config, _find_model_local_path
 from utils.logger import logger
+from model.base_model_loader import BaseModelLoader
 
 try:
-    from modelscope import AutoTokenizer as MS_AutoTokenizer, AutoModel as MS_AutoModel
+    from modelscope import AutoModel as MS_AutoModel
     MODELSCOPE_AVAILABLE = True
-    logger.info("modelscope 可用，将优先使用 modelscope 加载模型")
 except ImportError:
     MODELSCOPE_AVAILABLE = False
-    logger.info("modelscope 不可用，将使用 transformers 加载模型")
 
 try:
-    from transformers import AutoTokenizer as HF_AutoTokenizer, AutoModel as HF_AutoModel
+    from transformers import AutoModel as HF_AutoModel
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
-    logger.warning("transformers 不可用，模型加载选项受限")
 
 
-class AddressEmbedder:
+class AddressEmbedder(BaseModelLoader):
     """
     地址向量化器
-    
+
     使用 MGeo backbone 模型将地址文本转换为768维向量，用于粗召回阶段。
-    
+
     Attributes:
         model_name: 模型名称
         device: 运行设备 ('cuda' 或 'cpu')
@@ -59,11 +57,17 @@ class AddressEmbedder:
         model: 预训练模型
         vector_dim: 输出向量维度（默认768）
     """
-    
+
+    def _get_model_classes(self):
+        return (MS_AutoModel, HF_AutoModel)
+
+    def _get_model_label(self):
+        return '向量化模型'
+
     def __init__(self, model_name=None, device=None):
         """
         初始化向量化器
-        
+
         Args:
             model_name: 模型名称，默认使用 Config.EMBEDDING_MODEL_NAME
             device: 运行设备，默认使用 Config.DEVICE
@@ -73,6 +77,7 @@ class AddressEmbedder:
         self.tokenizer = None
         self.model = None
         self.vector_dim = 768  # mgeo_backbone_chinese_base 输出768维向量
+        self._fallback_count = 0  # 记录使用随机向量降级的批次数
         self._load_model()
     
     def _load_model(self):
@@ -96,16 +101,7 @@ class AddressEmbedder:
                 logger.warning(f"Config.LOCAL_EMBEDDING_PATH 未找到有效路径: {local_path}，重新搜索...")
                 local_path = _find_model_local_path(self.model_name)
 
-            if self.device == 'cuda' and not torch.cuda.is_available():
-                logger.warning("CUDA 不可用，切换到 CPU")
-                self.device = 'cpu'
-
-            import random
-            random.seed(42)
-            np.random.seed(42)
-            torch.manual_seed(42)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(42)
+            self._check_cuda_and_set_seed()
 
             loaded = False
 
@@ -155,71 +151,6 @@ class AddressEmbedder:
             logger.error(f"详细错误: {traceback.format_exc()}")
             raise
 
-    def _try_load_from_local(self, local_path):
-        """
-        尝试从本地路径加载模型
-
-        依次尝试 modelscope 和 transformers 两种加载方式
-
-        Args:
-            local_path: 本地模型目录路径
-
-        Returns:
-            bool: 加载成功返回 True
-        """
-        if MODELSCOPE_AVAILABLE:
-            try:
-                logger.info(f"使用 modelscope 从本地加载向量化模型: {local_path}")
-                self.tokenizer = MS_AutoTokenizer.from_pretrained(local_path, local_files_only=True)
-                self.model = MS_AutoModel.from_pretrained(local_path, local_files_only=True).to(self.device)
-                logger.info("modelscope 本地加载成功")
-                return True
-            except Exception as e:
-                logger.warning(f"modelscope 本地加载失败: {str(e)}")
-
-        if TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"使用 transformers 从本地加载向量化模型: {local_path}")
-                self.tokenizer = HF_AutoTokenizer.from_pretrained(local_path, local_files_only=True, trust_remote_code=True)
-                self.model = HF_AutoModel.from_pretrained(local_path, local_files_only=True, trust_remote_code=True).to(self.device)
-                logger.info("transformers 本地加载成功")
-                return True
-            except Exception as e:
-                logger.warning(f"transformers 本地加载失败: {str(e)}")
-
-        return False
-
-    def _try_load_from_model_name(self):
-        """
-        尝试从模型名称在线下载并加载
-
-        依次尝试 modelscope 和 transformers 两种加载方式
-
-        Returns:
-            bool: 加载成功返回 True
-        """
-        if MODELSCOPE_AVAILABLE:
-            try:
-                logger.info(f"使用 modelscope 在线下载模型: {self.model_name}")
-                self.tokenizer = MS_AutoTokenizer.from_pretrained(self.model_name)
-                self.model = MS_AutoModel.from_pretrained(self.model_name).to(self.device)
-                logger.info("modelscope 在线加载成功")
-                return True
-            except Exception as e:
-                logger.warning(f"modelscope 在线加载失败: {str(e)}")
-
-        if TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"使用 transformers 在线下载模型: {self.model_name}")
-                self.tokenizer = HF_AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
-                self.model = HF_AutoModel.from_pretrained(self.model_name, trust_remote_code=True).to(self.device)
-                logger.info("transformers 在线加载成功")
-                return True
-            except Exception as e:
-                logger.warning(f"transformers 在线加载失败: {str(e)}")
-
-        return False
-    
     def encode(self, texts, batch_size=None, max_len=64):
         """
         将文本列表转换为向量列表
@@ -273,12 +204,14 @@ class AddressEmbedder:
                 logger.error(f"批处理 {i//batch_size} 出错: {str(e)}")
                 import traceback
                 logger.error(f"详细错误: {traceback.format_exc()}")
+                # 不再使用随机向量填充（会污染相似度计算结果），改为零向量
+                # 零向量的相似度为 0，会被阈值自然过滤，不会产生错误匹配
                 batch_size_actual = len(batch_texts)
-                random_vectors = np.random.randn(batch_size_actual, self.vector_dim)
-                norms = np.linalg.norm(random_vectors, axis=1, keepdims=True)
-                batch_embeddings = random_vectors / norms
-                embeddings.append(batch_embeddings)
-                logger.warning(f"使用随机单位向量填充错误批次")
+                zero_vectors = np.zeros((batch_size_actual, self.vector_dim), dtype=np.float32)
+                embeddings.append(zero_vectors)
+                self._fallback_count += 1
+                logger.warning(f"批次向量化失败，使用零向量填充（累计降级 {self._fallback_count} 次），"
+                               f"影响地址: {batch_texts[:3]}")
         
         if embeddings:
             result = np.vstack(embeddings)

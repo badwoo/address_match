@@ -61,6 +61,11 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
+> **关键依赖说明**:
+> - `python-dotenv`: 支持 `.env` 文件配置，用于管理数据库连接等环境变量
+> - `pgvector`: PostgreSQL 向量扩展的 Python 驱动
+> - `modelscope` / `transformers`: MGeo 模型加载与推理
+
 > **GPU用户**: 如需使用GPU加速，请安装CUDA版PyTorch:
 > ```bash
 > pip install torch --index-url https://download.pytorch.org/whl/cu118
@@ -291,3 +296,18 @@ MGeo精排模型输出三个概率值：exact_match（精确匹配）、partial_
 - 标签用于隔离不同批次的匹配数据，每个标签有独立的召回表和匹配表
 - 删除标签时会同时删除关联的数据表
 - 在【结果管理】页面可按标签筛选查看对应数据
+
+### Q11: .env 文件配置不生效
+- 确认 `.env` 文件位于项目根目录（与 `app.py` 同级）
+- 确认文件名为 `.env`（非 `.env.txt` 或其他变体）
+- 确认环境变量名拼写正确：`DB_HOST`、`DB_PORT`、`DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_SCHEMA`
+- 确认 `.env` 文件中无多余空格或引号，正确格式为 `KEY=VALUE`
+- `.env` 中的配置仅作为数据库配置页面的默认值，仍需在界面中点击连接按钮
+- 如仍不生效，检查 `python-dotenv` 是否已安装：`pip show python-dotenv`
+
+### Q12: 地址结构化解析模型加载失败
+- 地址结构化解析模型（AddressTaggingModel）使用 `mgeo_backbone_chinese_base` 作为基础模型
+- 如果粗召回模型已成功加载，地址结构化解析模型通常也能正常加载（共用同一基础模型）
+- 检查模型文件是否完整，参考 Q1 的排查步骤
+- 确认 `mgeo_backbone_chinese_base` 目录下包含 `config.json`、`pytorch_model.bin` 等必要文件
+- 查看系统日志中 AddressTaggingModel 的加载过程，确认是否有报错信息

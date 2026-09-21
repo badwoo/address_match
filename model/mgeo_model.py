@@ -26,7 +26,7 @@ MGeo地址相似度匹配模型模块
 性能优化：
     1. padding='longest' - 按batch内最长序列padding，避免大量无效计算
     2. GPU半精度(FP16)推理 - GPU上自动启用，推理速度提升约2倍
-    3. 增大批处理默认值 - GPU上默认128，CPU上默认64
+    3. 增大批处理默认值 - GPU上默认256，CPU上默认64
     4. 精简结果字典 - 仅保留精排所需字段，减少内存和GC开销
     5. 批量numpy操作 - 减少逐元素Python循环
 """
@@ -36,23 +36,22 @@ import numpy as np
 import os
 from config import Config, _find_model_local_path
 from utils.logger import logger
+from model.base_model_loader import BaseModelLoader
 
 try:
-    from modelscope import AutoTokenizer as MS_AutoTokenizer, AutoModelForSequenceClassification as MS_AutoModelForSeqCls
+    from modelscope import AutoModelForSequenceClassification as MS_AutoModelForSeqCls
     MODELSCOPE_AVAILABLE = True
 except ImportError:
     MODELSCOPE_AVAILABLE = False
-    logger.info("mgeo_model: modelscope 不可用，将使用 transformers 加载模型")
 
 try:
-    from transformers import AutoTokenizer as HF_AutoTokenizer, AutoModelForSequenceClassification as HF_AutoModelForSeqCls
+    from transformers import AutoModelForSequenceClassification as HF_AutoModelForSeqCls
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
-    logger.warning("mgeo_model: transformers 不可用，模型加载选项受限")
 
 
-class MGeoModel:
+class MGeoModel(BaseModelLoader):
     """
     MGeo地址相似度匹配模型
 
@@ -66,6 +65,12 @@ class MGeoModel:
         model: 序列分类模型
         use_fp16: 是否使用半精度推理
     """
+
+    def _get_model_classes(self):
+        return (MS_AutoModelForSeqCls, HF_AutoModelForSeqCls)
+
+    def _get_model_label(self):
+        return 'MGeo模型'
 
     def __init__(self, model_name=None, revision=None, device=None):
         """
@@ -107,8 +112,8 @@ class MGeoModel:
                但HuggingFace BERT模型期望 bert.* 前缀。加载时需进行键名映射，
                否则BERT编码器权重不会被加载，导致模型输出随机结果。
 
-            2. 模型训练时标签顺序为 ['not_match', 'partial_match', 'exact_match']，
-               对应输出索引 0=not_match, 1=partial_match, 2=exact_match。
+            2. 模型训练时标签顺序为 ['exact_match', 'not_match', 'partial_match']，
+               对应输出索引 0=exact_match, 1=not_match, 2=partial_match。
                config.json中id2label必须与此一致。
 
             3. 不要使用ignore_mismatched_sizes=True参数，否则会导致分类头权重被随机初始化。
@@ -120,9 +125,7 @@ class MGeoModel:
                 logger.warning(f"Config.LOCAL_MODEL_PATH 未找到有效路径: {local_path}，重新搜索...")
                 local_path = _find_model_local_path(self.model_name)
 
-            if self.device == 'cuda' and not torch.cuda.is_available():
-                logger.warning("CUDA not available, falling back to CPU")
-                self.device = 'cpu'
+            self._check_cuda_and_set_seed()
 
             loaded = False
 
@@ -172,142 +175,6 @@ class MGeoModel:
         except Exception as e:
             logger.error(f"Failed to load MGeo model: {str(e)}")
             raise
-
-    def _try_load_from_local(self, local_path):
-        """
-        尝试从本地路径加载模型
-
-        依次尝试 modelscope 和 transformers 两种加载方式
-
-        Args:
-            local_path: 本地模型目录路径
-
-        Returns:
-            bool: 加载成功返回 True
-        """
-        if MODELSCOPE_AVAILABLE:
-            try:
-                logger.info(f"使用 modelscope 从本地加载MGeo模型: {local_path}")
-                self.tokenizer = MS_AutoTokenizer.from_pretrained(local_path, local_files_only=True)
-                self.model = MS_AutoModelForSeqCls.from_pretrained(local_path, local_files_only=True).to(self.device)
-                logger.info("modelscope 本地加载MGeo模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"modelscope 本地加载MGeo模型失败: {str(e)}")
-
-        if TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"使用 transformers 从本地加载MGeo模型: {local_path}")
-                self.tokenizer = HF_AutoTokenizer.from_pretrained(local_path, local_files_only=True, trust_remote_code=True)
-                self.model = HF_AutoModelForSeqCls.from_pretrained(local_path, local_files_only=True, trust_remote_code=True).to(self.device)
-                logger.info("transformers 本地加载MGeo模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"transformers 本地加载MGeo模型失败: {str(e)}")
-
-        return False
-
-    def _try_load_from_model_name(self):
-        """
-        尝试从模型名称在线下载并加载
-
-        依次尝试 modelscope 和 transformers 两种加载方式
-
-        Returns:
-            bool: 加载成功返回 True
-        """
-        if MODELSCOPE_AVAILABLE:
-            try:
-                logger.info(f"使用 modelscope 在线下载MGeo模型: {self.model_name}")
-                self.tokenizer = MS_AutoTokenizer.from_pretrained(self.model_name)
-                self.model = MS_AutoModelForSeqCls.from_pretrained(self.model_name).to(self.device)
-                logger.info("modelscope 在线加载MGeo模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"modelscope 在线加载MGeo模型失败: {str(e)}")
-
-        if TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"使用 transformers 在线下载MGeo模型: {self.model_name}")
-                self.tokenizer = HF_AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
-                self.model = HF_AutoModelForSeqCls.from_pretrained(self.model_name, trust_remote_code=True).to(self.device)
-                logger.info("transformers 在线加载MGeo模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"transformers 在线加载MGeo模型失败: {str(e)}")
-
-        return False
-
-    def _fix_checkpoint_key_mapping(self):
-        """
-        修复checkpoint键名映射问题
-
-        ModelScope原始checkpoint中BERT编码器键名使用 bert.text_encoder.* 前缀，
-        但HuggingFace BERT模型期望 bert.* 前缀。此方法检测并修复键名不匹配问题。
-        自动检测模型加载的实际路径（可能是本地路径或缓存路径）。
-        """
-        model_path = None
-        if hasattr(self.model, 'name_or_path') and self.model.name_or_path:
-            model_path = self.model.name_or_path
-
-        if not model_path:
-            local_path = Config.LOCAL_MODEL_PATH
-            if local_path and os.path.isdir(local_path):
-                model_path = local_path
-            else:
-                model_path = _find_model_local_path(self.model_name)
-
-        if not model_path or not os.path.isdir(model_path):
-            logger.info("无法确定模型路径，跳过checkpoint键名映射检查")
-            return
-
-        ckpt_path = os.path.join(model_path, 'pytorch_model.bin')
-        if not os.path.exists(ckpt_path):
-            ckpt_path_safetensors = os.path.join(model_path, 'model.safetensors')
-            if not os.path.exists(ckpt_path_safetensors):
-                logger.info("未找到 pytorch_model.bin 或 model.safetensors，跳过键名映射检查")
-                return
-            ckpt_path = ckpt_path_safetensors
-
-        state_dict = self.model.state_dict()
-        model_keys = set(state_dict.keys())
-
-        if ckpt_path.endswith('.safetensors'):
-            try:
-                from safetensors.torch import load_file
-                checkpoint = load_file(ckpt_path)
-            except ImportError:
-                logger.warning("safetensors 库不可用，无法检查 .safetensors 格式的checkpoint")
-                return
-        else:
-            checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-
-        ckpt_keys = set(checkpoint.keys())
-
-        text_encoder_keys = [k for k in ckpt_keys if k.startswith('bert.text_encoder.')]
-        if not text_encoder_keys:
-            logger.info("No bert.text_encoder.* keys found in checkpoint, key mapping OK")
-            return
-
-        logger.warning(f"Found {len(text_encoder_keys)} keys with 'bert.text_encoder.' prefix in checkpoint. "
-                      f"Applying key name mapping...")
-
-        new_checkpoint = {}
-        renamed = 0
-        for key in checkpoint.keys():
-            new_key = key.replace('bert.text_encoder.', 'bert.')
-            new_checkpoint[new_key] = checkpoint[key]
-            if new_key != key:
-                renamed += 1
-
-        missing, unexpected = self.model.load_state_dict(new_checkpoint, strict=False)
-
-        if missing:
-            logger.warning(f"Missing keys after key mapping fix: {missing}")
-        if unexpected:
-            logger.warning(f"Unexpected keys after key mapping fix: {unexpected}")
-
-        logger.info(f"Key mapping applied: {renamed} keys renamed from bert.text_encoder.* to bert.*")
 
     def _get_default_batch_size(self):
         """
@@ -394,7 +261,8 @@ class MGeoModel:
                         'labels': [self.label_map.get(i, '') for i in range(len(self.label_map))],
                         'exact_match': 0.0,
                         'not_match': 1.0,
-                        'partial_match': 0.0
+                        'partial_match': 0.0,
+                        '_error': str(e)  # 标记预测失败，供上层识别
                     })
 
         return results
@@ -452,9 +320,10 @@ class MGeoModel:
 
                 predictions = probs.cpu().numpy()
 
-                not_match_arr = predictions[:, 0]
-                partial_match_arr = predictions[:, 1]
-                exact_match_arr = predictions[:, 2]
+                # 模型输出索引对应 id2label: 0=exact_match, 1=not_match, 2=partial_match
+                exact_match_arr = predictions[:, 0]
+                not_match_arr = predictions[:, 1]
+                partial_match_arr = predictions[:, 2]
 
                 for j in range(batch_len):
                     results[batch_indices[j]] = {
@@ -469,7 +338,8 @@ class MGeoModel:
                     results[batch_indices[j]] = {
                         'exact_match': 0.0,
                         'not_match': 1.0,
-                        'partial_match': 0.0
+                        'partial_match': 0.0,
+                        '_error': str(e)  # 标记预测失败，供上层识别
                     }
 
         return results

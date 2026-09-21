@@ -1,10 +1,16 @@
-"""地址匹配系统一键启动器"""
-import subprocess
-import webbrowser
-import time
-import sys
+"""地址匹配系统一键启动器
+
+设计要点：
+- 让 Streamlit 继承当前控制台窗口运行，不额外创建窗口。
+- 因此关闭 CMD 窗口时，Windows 会一起终止 Streamlit。
+- Ctrl+C 会同时发给本程序和 Streamlit，本程序做兜底清理。
+"""
 import os
 import socket
+import subprocess
+import sys
+import time
+import webbrowser
 
 
 _PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit_pid")
@@ -18,8 +24,16 @@ def _write_pid(pid):
         pass
 
 
+def _cleanup_pid_file():
+    try:
+        if os.path.exists(_PID_FILE):
+            os.remove(_PID_FILE)
+    except Exception:
+        pass
+
+
 def _cleanup_port(port=8501):
-    """杀掉占用指定端口的进程（纯 taskkill，无 ctypes 依赖）"""
+    """杀掉占用指定端口的进程（仅 Windows）"""
     if sys.platform != "win32":
         return
     try:
@@ -64,16 +78,10 @@ def main():
     _cleanup_port(8501)
 
     print("[1/3] 启动 Streamlit 服务...")
-    kwargs = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
+    # 关键：不指定 CREATE_NO_WINDOW，也不 pipe stdout/stderr，
+    # 让 Streamlit 直接写当前控制台。关闭控制台时系统会一起终止它。
     proc = subprocess.Popen(
         [sys.executable, "-m", "streamlit", "run", "app.py", "--server.headless", "true"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        **kwargs,
     )
     _write_pid(proc.pid)
     print(f"   Streamlit PID: {proc.pid}")
@@ -81,13 +89,28 @@ def main():
     print("[2/3] 等待服务就绪...")
     if not wait_for_port():
         print("服务启动超时！")
-        proc.kill()
-        proc.wait()
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        _cleanup_pid_file()
+        input("按回车键退出...")
+        sys.exit(1)
+
+    if proc.poll() is not None:
+        print("Streamlit 服务异常退出，请检查上方错误信息。")
+        _cleanup_pid_file()
         input("按回车键退出...")
         sys.exit(1)
 
     print("[3/3] 打开浏览器...")
-    webbrowser.open("http://localhost:8501")
+    try:
+        webbrowser.open("http://localhost:8501")
+    except Exception as e:
+        print(f"   浏览器打开失败: {e}")
+        print("   请手动访问 http://localhost:8501")
     print()
     print("=" * 40)
     print("  浏览器已打开，访问 http://localhost:8501")
@@ -96,34 +119,19 @@ def main():
     print()
 
     try:
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                print(line, end="")
+        # 主线程阻塞等待 Streamlit；Ctrl+C 会触发 KeyboardInterrupt
+        proc.wait()
     except KeyboardInterrupt:
         print("\n正在停止服务...")
     finally:
-        # 关闭 Streamlit
-        try:
-            if proc.poll() is None:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True, timeout=10,
-                )
-                proc.wait(timeout=5)
-        except Exception:
+        if proc.poll() is None:
+            proc.terminate()
             try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
-            except Exception:
-                pass
-        # 清理 PID 文件
-        try:
-            os.remove(_PID_FILE)
-        except Exception:
-            pass
+        _cleanup_pid_file()
         print("服务已停止。")
 
 

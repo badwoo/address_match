@@ -50,6 +50,7 @@ import numpy as np
 import os
 from config import Config, _find_model_local_path
 from utils.logger import logger
+from model.base_model_loader import BaseModelLoader
 
 TAGGING_MODEL_NAME = 'iic/mgeo_geographic_elements_tagging_chinese_base'
 
@@ -132,21 +133,19 @@ for _f in _BASE_17_FIELDS:
     OUTPUT_FIELD_LABELS_17_2[f'{_f}_2'] = f'{_label}(副)'
 
 try:
-    from modelscope import AutoTokenizer as MS_AutoTokenizer, AutoModelForTokenClassification as MS_AutoModelForTokenCls
+    from modelscope import AutoModelForTokenClassification as MS_AutoModelForTokenCls
     MODELSCOPE_AVAILABLE = True
 except ImportError:
     MODELSCOPE_AVAILABLE = False
-    logger.info("address_tagging_model: modelscope 不可用，将使用 transformers 加载模型")
 
 try:
-    from transformers import AutoTokenizer as HF_AutoTokenizer, AutoModelForTokenClassification as HF_AutoModelForTokenCls
+    from transformers import AutoModelForTokenClassification as HF_AutoModelForTokenCls
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
-    logger.warning("address_tagging_model: transformers 不可用，模型加载选项受限")
 
 
-class AddressTaggingModel:
+class AddressTaggingModel(BaseModelLoader):
     """
     MGeo门址地址结构化要素解析模型
 
@@ -162,6 +161,16 @@ class AddressTaggingModel:
         id2label: 标签ID到标签名的映射
     """
 
+    def _get_model_classes(self):
+        return (MS_AutoModelForTokenCls, HF_AutoModelForTokenCls)
+
+    def _get_model_label(self):
+        return '地址要素解析模型'
+
+    def _get_extra_load_kwargs(self):
+        """地址要素解析模型需要 num_labels 参数"""
+        return {'num_labels': self._num_labels}
+
     def __init__(self, model_name=None, device=None):
         self.model_name = model_name or TAGGING_MODEL_NAME
         self.device = device or Config.DEVICE
@@ -169,6 +178,7 @@ class AddressTaggingModel:
         self.model = None
         self.use_fp16 = False
         self.id2label = {}
+        self._num_labels = 57  # 默认值，_load_model 中会根据配置更新
         self._load_model()
 
     def _load_model(self):
@@ -184,9 +194,11 @@ class AddressTaggingModel:
         try:
             local_path = _find_model_local_path(self.model_name)
 
-            if self.device == 'cuda' and not torch.cuda.is_available():
-                logger.warning("CUDA not available, falling back to CPU")
-                self.device = 'cpu'
+            self._check_cuda_and_set_seed()
+
+            # 从本地配置读取 num_labels，用于 _get_extra_load_kwargs
+            if local_path and os.path.isdir(local_path):
+                self._num_labels = self._get_num_labels_from_config(local_path)
 
             loaded = False
 
@@ -259,124 +271,6 @@ class AddressTaggingModel:
             except Exception as e:
                 logger.warning(f"读取 configuration.json 失败: {str(e)}")
         return 57
-
-    def _try_load_from_local(self, local_path):
-        num_labels = self._get_num_labels_from_config(local_path)
-        
-        if MODELSCOPE_AVAILABLE:
-            try:
-                logger.info(f"使用 modelscope 从本地加载地址要素解析模型: {local_path}")
-                self.tokenizer = MS_AutoTokenizer.from_pretrained(local_path, local_files_only=True)
-                self.model = MS_AutoModelForTokenCls.from_pretrained(
-                    local_path, local_files_only=True, num_labels=num_labels
-                ).to(self.device)
-                logger.info("modelscope 本地加载地址要素解析模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"modelscope 本地加载地址要素解析模型失败: {str(e)}")
-
-        if TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"使用 transformers 从本地加载地址要素解析模型: {local_path}")
-                self.tokenizer = HF_AutoTokenizer.from_pretrained(local_path, local_files_only=True, trust_remote_code=True)
-                self.model = HF_AutoModelForTokenCls.from_pretrained(
-                    local_path, local_files_only=True, trust_remote_code=True, num_labels=num_labels
-                ).to(self.device)
-                logger.info("transformers 本地加载地址要素解析模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"transformers 本地加载地址要素解析模型失败: {str(e)}")
-
-        return False
-
-    def _try_load_from_model_name(self):
-        if MODELSCOPE_AVAILABLE:
-            try:
-                logger.info(f"使用 modelscope 在线下载地址要素解析模型: {self.model_name}")
-                self.tokenizer = MS_AutoTokenizer.from_pretrained(self.model_name)
-                self.model = MS_AutoModelForTokenCls.from_pretrained(
-                    self.model_name, ignore_mismatched_sizes=True
-                ).to(self.device)
-                logger.info("modelscope 在线加载地址要素解析模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"modelscope 在线加载地址要素解析模型失败: {str(e)}")
-
-        if TRANSFORMERS_AVAILABLE:
-            try:
-                logger.info(f"使用 transformers 在线下载地址要素解析模型: {self.model_name}")
-                self.tokenizer = HF_AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
-                self.model = HF_AutoModelForTokenCls.from_pretrained(
-                    self.model_name, trust_remote_code=True, ignore_mismatched_sizes=True
-                ).to(self.device)
-                logger.info("transformers 在线加载地址要素解析模型成功")
-                return True
-            except Exception as e:
-                logger.warning(f"transformers 在线加载地址要素解析模型失败: {str(e)}")
-
-        return False
-
-    def _fix_checkpoint_key_mapping(self):
-        """
-        修复checkpoint键名映射问题
-
-        ModelScope原始checkpoint中BERT编码器键名使用 bert.text_encoder.* 前缀，
-        但HuggingFace BERT模型期望 bert.* 前缀。此方法检测并修复键名不匹配问题。
-        """
-        import os
-        model_path = None
-        if hasattr(self.model, 'name_or_path') and self.model.name_or_path:
-            model_path = self.model.name_or_path
-
-        if not model_path:
-            model_path = _find_model_local_path(self.model_name)
-
-        if not model_path or not os.path.isdir(model_path):
-            logger.info("[地址要素解析] 无法确定模型路径，跳过checkpoint键名映射检查")
-            return
-
-        ckpt_path = os.path.join(model_path, 'pytorch_model.bin')
-        if not os.path.exists(ckpt_path):
-            ckpt_path_safetensors = os.path.join(model_path, 'model.safetensors')
-            if not os.path.exists(ckpt_path_safetensors):
-                logger.info("[地址要素解析] 未找到 pytorch_model.bin 或 model.safetensors，跳过键名映射检查")
-                return
-            ckpt_path = ckpt_path_safetensors
-
-        if ckpt_path.endswith('.safetensors'):
-            try:
-                from safetensors.torch import load_file
-                checkpoint = load_file(ckpt_path)
-            except ImportError:
-                logger.warning("[地址要素解析] safetensors 库不可用，无法检查 .safetensors 格式的checkpoint")
-                return
-        else:
-            checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-
-        ckpt_keys = set(checkpoint.keys())
-        text_encoder_keys = [k for k in ckpt_keys if k.startswith('bert.text_encoder.')]
-        if not text_encoder_keys:
-            logger.info("[地址要素解析] checkpoint中未找到 bert.text_encoder.* 键名，键名映射OK")
-            return
-
-        logger.warning(f"[地址要素解析] 发现 {len(text_encoder_keys)} 个 bert.text_encoder.* 前缀键名，应用键名映射...")
-
-        new_checkpoint = {}
-        renamed = 0
-        for key in checkpoint.keys():
-            new_key = key.replace('bert.text_encoder.', 'bert.')
-            new_checkpoint[new_key] = checkpoint[key]
-            if new_key != key:
-                renamed += 1
-
-        missing, unexpected = self.model.load_state_dict(new_checkpoint, strict=False)
-
-        if missing:
-            logger.warning(f"[地址要素解析] 键名映射后仍缺失的键: {len(missing)}个")
-        if unexpected:
-            logger.warning(f"[地址要素解析] 键名映射后多余的键: {len(unexpected)}个")
-
-        logger.info(f"[地址要素解析] 键名映射完成: {renamed}个键从 bert.text_encoder.* 重命名为 bert.*")
 
     def _get_default_batch_size(self):
         if self.device == 'cuda':
@@ -675,6 +569,64 @@ class AddressTaggingModel:
 
         return result
 
+    def _post_process_17_entities(self, entity_list, original_address):
+        """
+        对17级NER实体列表进行后处理修正
+
+        修正规则：
+        1. 短实体合并：当一个 B-xxx 实体只有1个字符，紧接着的 I/E-yyy 实体
+           在原始地址中与该 B-xxx 连续，且当前已存在同类型的 yyy 实体，
+           则将 yyy 实体合并到 xxx 中（修正模型的NER标签预测偏差）
+
+        典型场景：模型输出 [("poi","天"),("community","井湖村")]，
+        但地址中已有 community "碧波社区"，"井湖村"应为 poi 的一部分，
+        修正为 [("poi","天井湖村")]
+
+        Args:
+            entity_list: [(ner_tag, text), ...] 有序实体列表
+            original_address: 原始地址文本
+
+        Returns:
+            list of (ner_tag, text): 修正后的有序实体列表
+        """
+        if len(entity_list) < 2:
+            return entity_list
+
+        # 统计每种NER标签出现的次数
+        tag_counts = {}
+        for ner_tag, text in entity_list:
+            tag_counts[ner_tag] = tag_counts.get(ner_tag, 0) + 1
+
+        fixed = list(entity_list)
+        i = 0
+        while i < len(fixed) - 1:
+            curr_tag, curr_text = fixed[i]
+            next_tag, next_text = fixed[i + 1]
+
+            # 条件1：当前实体只有1个字符（短实体）
+            if len(curr_text) == 1:
+                # 条件2：当前实体和下一个实体在原始地址中连续
+                curr_pos = original_address.find(curr_text)
+                if curr_pos != -1:
+                    next_pos = original_address.find(next_text, curr_pos + len(curr_text))
+                    # 连续判断：下一个实体紧跟着当前实体（允许1个字符间隙，如空格）
+                    if next_pos != -1 and next_pos <= curr_pos + len(curr_text) + 1:
+                        # 条件3：next_tag 已有出现（重复标签），
+                        # 且 curr_tag 还没出现过（或只出现1次即当前实体）
+                        if tag_counts.get(next_tag, 0) > 1 and tag_counts.get(curr_tag, 0) == 1:
+                            # 合并：将 next 实体合并到 curr 实体中
+                            merged_text = curr_text + next_text
+                            fixed[i] = (curr_tag, merged_text)
+                            del fixed[i + 1]
+                            # 更新 tag_counts
+                            tag_counts[next_tag] = tag_counts.get(next_tag, 0) - 1
+                            # 不递增 i，继续检查合并后的实体是否还需要继续合并
+                            continue
+
+            i += 1
+
+        return fixed
+
     def _ner_to_structured_17(self, entity_list):
         """
         将NER实体列表直接映射为17级结构化输出（不做合并映射，保留原始标签）
@@ -707,7 +659,8 @@ class AddressTaggingModel:
 
         规则：
         - 第一个匹配值写入主字段（如 poi）
-        - 第二个及后续同类型值拼接到 _2 后缀字段（如 poi_2）
+        - 第二个同类型值写入 _2 后缀字段（如 poi_2）
+        - 第三个及后续同类型值舍弃
         - 不做 post-processing 修正
 
         Args:
@@ -722,31 +675,53 @@ class AddressTaggingModel:
             if ner_tag not in OUTPUT_FIELDS_17:
                 continue
             if not result[ner_tag]:
+                # 第一个同类型值 → 主字段
                 result[ner_tag] = text
-            else:
-                field_2 = f'{ner_tag}_2'
-                if result[field_2]:
-                    result[field_2] += text
-                else:
-                    result[field_2] = text
+            elif not result[f'{ner_tag}_2']:
+                # 第二个同类型值 → _2 字段
+                result[f'{ner_tag}_2'] = text
+            # 第三个及后续同类型值舍弃
 
         return result
 
-    def _build_dom_json(self, entity_list):
+    def _build_dom_json(self, entity_list, original_address=''):
         """
-        构建解析后的实体JSON字符串
+        构建解析后的实体JSON字符串（标准DOM格式）
 
-        将NER解析后的实体列表序列化为JSON数组，
-        每个元素为 [NER标签, 实体文本] 对。
+        格式：{"text":"原始地址","elements":[{"type":"标签","span":"实体文本","start":0,"end":3},...]}
 
         Args:
             entity_list: [(ner_tag, text), ...] 有序实体列表
+            original_address: 原始地址文本
 
         Returns:
-            str: JSON字符串，格式如 [["prov","广东省"],["city","深圳市"],...]
+            str: JSON字符串
         """
         import json
-        return json.dumps(entity_list, ensure_ascii=False)
+        elements = []
+        search_start = 0
+        for ner_tag, text in entity_list:
+            # 在原始地址中查找实体文本的位置
+            pos = original_address.find(text, search_start)
+            if pos != -1:
+                start = pos
+                end = pos + len(text)
+                search_start = end  # 后续查找从当前位置之后开始
+            else:
+                # 未找到时使用已处理长度的估算位置
+                start = search_start
+                end = search_start + len(text)
+                search_start = end
+            elements.append({
+                'type': ner_tag,
+                'span': text,
+                'start': start,
+                'end': end
+            })
+        return json.dumps({
+            'text': original_address,
+            'elements': elements
+        }, ensure_ascii=False)
 
     def predict(self, addresses, batch_size=None):
         """
@@ -856,7 +831,7 @@ class AddressTaggingModel:
                 valid_addresses.append(addr.strip())
             else:
                 results[idx] = {
-                    'original_address': addr, 'dom_json': '[]',
+                    'original_address': addr, 'dom_json': '{"text":"","elements":[]}',
                     **{field: '' for field in OUTPUT_FIELDS_17}
                 }
 
@@ -898,8 +873,9 @@ class AddressTaggingModel:
                             active_labels.append(int(pred_ids[j][k]))
 
                     entity_list = self._parse_bio_tags(active_tokens, active_labels)
+                    entity_list = self._post_process_17_entities(entity_list, addr)
                     structured = self._ner_to_structured_17(entity_list)
-                    dom_json = self._build_dom_json(entity_list)
+                    dom_json = self._build_dom_json(entity_list, addr)
                     results[result_idx] = {
                         'original_address': addr, 'dom_json': dom_json, **structured
                     }
@@ -908,7 +884,7 @@ class AddressTaggingModel:
                 logger.error(f"地址要素解析(17级)批量预测错误 batch {i // batch_size}: {str(e)}")
                 for result_idx in batch_indices:
                     results[result_idx] = {
-                        'original_address': addresses[result_idx], 'dom_json': '[]',
+                        'original_address': addresses[result_idx], 'dom_json': '{"text":"","elements":[]}',
                         **{field: '' for field in OUTPUT_FIELDS_17}
                     }
 
@@ -944,7 +920,7 @@ class AddressTaggingModel:
                 valid_addresses.append(addr.strip())
             else:
                 results[idx] = {
-                    'original_address': addr, 'dom_json': '[]',
+                    'original_address': addr, 'dom_json': '{"text":"","elements":[]}',
                     **{field: '' for field in OUTPUT_FIELDS_17_2}
                 }
 
@@ -983,8 +959,9 @@ class AddressTaggingModel:
                             active_labels.append(int(pred_ids[j][k]))
 
                     entity_list = self._parse_bio_tags(active_tokens, active_labels)
+                    entity_list = self._post_process_17_entities(entity_list, addr)
                     structured = self._ner_to_structured_17_2(entity_list)
-                    dom_json = self._build_dom_json(entity_list)
+                    dom_json = self._build_dom_json(entity_list, addr)
                     results[result_idx] = {
                         'original_address': addr, 'dom_json': dom_json, **structured
                     }
@@ -993,7 +970,7 @@ class AddressTaggingModel:
                 logger.error(f"地址要素解析(17_2)批量预测错误 batch {i // batch_size}: {str(e)}")
                 for result_idx in batch_indices:
                     results[result_idx] = {
-                        'original_address': addresses[result_idx], 'dom_json': '[]',
+                        'original_address': addresses[result_idx], 'dom_json': '{"text":"","elements":[]}',
                         **{field: '' for field in OUTPUT_FIELDS_17_2}
                     }
 

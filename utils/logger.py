@@ -115,8 +115,13 @@ class DBLogHandler(logging.Handler):
         try:
             sql = "INSERT INTO app_log (level, message) VALUES %s"
             from psycopg2 import extras
-            extras.execute_values(self.db_conn.cursor, sql, self._queue, page_size=100)
-            self.db_conn.commit()
+            cursor = self.db_conn.get_cursor()
+            if cursor:
+                try:
+                    extras.execute_values(cursor, sql, self._queue, page_size=100)
+                    self.db_conn.commit()
+                finally:
+                    cursor.close()
         except Exception:
             pass
         self._queue = []
@@ -128,8 +133,8 @@ class DBLogHandler(logging.Handler):
         if self.db_conn:
             try:
                 self._flush_queue()
-                check_sql = "SELECT 1"
-                self.db_conn.cursor.execute(check_sql)
+                # 直接执行 INSERT，不再额外 SELECT 1 检查连接
+                # execute() 内部已有自动重连机制
                 sql = "INSERT INTO app_log (level, message) VALUES (%s, %s)"
                 self.db_conn.execute(sql, (record.levelname, msg))
                 self.db_conn.commit()

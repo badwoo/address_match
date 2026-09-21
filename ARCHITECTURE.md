@@ -2,55 +2,56 @@
 
 ## 一、系统架构概览
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              用户界面层 (Streamlit)                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
-│  │ 数据库配置 │  │ 向量预处理 │  │ 地址匹配  │  │ 结果管理  │  │ 系统日志  │      │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘      │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              应用核心层 (app.py)                             │
-│  - 页面路由与状态管理                                                          │
-│  - 用户交互处理                                                               │
-│  - 各功能模块协调                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────┬──────────────┬──────────────┬──────────────┬─────────────────┐
-│   配置模块    │  数据库连接层  │  向量存储层   │   匹配引擎层  │    模型层        │
-│  (config.py) │ (connection) │(vector_store)│  (matcher)   │   (model)       │
-├──────────────┼──────────────┼──────────────┼──────────────┼─────────────────┤
-│ 系统配置参数  │ DBConnection │ VectorStore  │AddressMatcher│ AddressEmbedder │
-│ 数据库配置   │ DataLoader   │              │RankingEngine │   MGeoModel     │
-│ 模型配置    │              │              │MGeoSimilarity│                 │
-└──────────────┴──────────────┴──────────────┴──────────────┴─────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              数据持久化层                                     │
-│                    PostgreSQL + pgvector 扩展                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
-│  │ 企业向量表 │  │标准地址向量表│  │ 召回结果表 │  │ 匹配结果表 │  │ 相似度结果表 │      │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘      │
-│  ┌──────────┐  ┌──────────┐                                                  │
-│  │ 标签配置表 │  │ 系统日志表 │                                                  │
-│  └──────────┘  └──────────┘                                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              模型层                                          │
-│  ┌──────────────────────────────┐  ┌──────────────────────────────────────┐  │
-│  │   粗召回模型                    │  │          精排模型                     │  │
-│  │ mgeo_backbone_chinese_base    │  │ mgeo_geographic_entity_alignment_   │  │
-│  │   (地址编码器)                  │  │        chinese_base                 │  │
-│  │   - 生成地址向量                │  │   (地址匹配分类器)                     │  │
-│  │   - 支持CPU/GPU               │  │   - 精确匹配/部分匹配/不匹配分类        │  │
-│  └──────────────────────────────┘  └──────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph UI["用户界面层 (Streamlit 多页面架构)"]
+        direction LR
+        P1["数据库配置"]
+        P2["地址结构化解析"]
+        P3["向量预处理"]
+        P4["地址匹配"]
+        P5["结果管理"]
+        P6["系统日志"]
+        P7["首页"]
+    end
+
+    subgraph CORE["应用核心层"]
+        direction LR
+        APP["app.py<br/>入口路由 + 首页"]
+        PAGES["pages/<br/>7个页面模块"]
+        COMMON["app_common.py<br/>公共工具函数"]
+    end
+
+    subgraph SERVICE["服务层"]
+        direction LR
+        CFG["配置模块<br/>config.py"]
+        DB["数据库连接层<br/>connection.py<br/>data_loader.py"]
+        VS["向量存储层<br/>vector_store.py"]
+        MATCH["匹配引擎层<br/>matcher.py<br/>ranking.py<br/>mgeo_similarity.py<br/>address_tagging.py"]
+        MDL["模型层<br/>embedding.py<br/>mgeo_model.py<br/>address_tagging_model.py<br/>base_model_loader.py"]
+    end
+
+    subgraph DATA["数据持久化层"]
+        direction LR
+        T1["企业向量表"]
+        T2["标准地址向量表"]
+        T3["召回结果表"]
+        T4["匹配结果表"]
+        T5["相似度结果表"]
+        T6["标签配置表"]
+        T7["系统日志表"]
+    end
+
+    subgraph MODEL["模型层"]
+        direction LR
+        M1["粗召回模型<br/>mgeo_backbone_chinese_base<br/>地址编码器 / 生成向量"]
+        M2["精排模型<br/>mgeo_geographic_entity_alignment_chinese_base<br/>地址匹配分类器"]
+    end
+
+    UI --> CORE
+    CORE --> SERVICE
+    SERVICE --> DATA
+    SERVICE --> MODEL
 ```
 
 ## 二、模块职责
@@ -404,37 +405,56 @@
 
 ```
 address_match/
-├── app.py                          # 主应用（Streamlit界面）
-├── config.py                       # 系统配置
+├── app.py                          # 主应用入口（路由 + 首页）
+├── app_common.py                   # 公共工具函数
+├── config.py                       # 系统配置（支持 .env）
+├── ui_theme.py                     # UI 主题样式
+├── .env.example                    # 环境变量模板
 ├── requirements.txt                # Python依赖
-├── ARCHITECTURE.md                 # 架构设计文档（本文档）
+├── ARCHITECTURE.md                 # 架构设计文档
 ├── DEPLOYMENT.md                   # 部署文档
 ├── OPERATION_MANUAL.md             # 使用说明文档
-├── .gitignore                      # Git忽略配置
 │
 ├── database/                       # 数据库模块
 │   ├── __init__.py
-│   ├── connection.py               # 数据库连接
-│   ├── data_loader.py              # 数据加载器
-│   ├── vector_store.py             # 向量存储
+│   ├── connection.py               # 数据库连接（含 cursor 管理 + SQL 注入防护）
+│   ├── data_loader.py              # 数据加载器（含通用方法抽取）
+│   ├── vector_store.py             # 向量存储（含 SQL 注入防护）
 │   └── tag_manager.py              # 标签管理
 │
 ├── matching/                       # 匹配引擎
 │   ├── __init__.py
-│   ├── matcher.py                  # 地址匹配器
+│   ├── matcher.py                  # 地址匹配器（线程安全）
 │   ├── ranking.py                  # 排序引擎
-│   └── mgeo_similarity.py          # MGeo相似度
+│   ├── mgeo_similarity.py          # MGeo相似度
+│   └── address_tagging.py          # 地址结构化解析
 │
 ├── model/                          # 模型层
 │   ├── __init__.py
-│   ├── embedding.py                # 地址编码器
-│   └── mgeo_model.py               # MGeo分类模型
+│   ├── base_model_loader.py        # 模型加载基类
+│   ├── embedding.py                # 地址编码器（继承 BaseModelLoader）
+│   ├── mgeo_model.py               # MGeo分类模型（继承 BaseModelLoader）
+│   └── address_tagging_model.py    # 地址结构化解析模型（继承 BaseModelLoader）
+│
+├── pages/                          # 页面模块
+│   ├── __init__.py
+│   ├── db_config.py                # 数据库配置页
+│   ├── vector_preprocess.py        # 向量预处理页
+│   ├── address_matching.py         # 地址匹配页
+│   ├── mgeo_similarity.py          # MGeo相似度页
+│   ├── address_tagging.py          # 地址结构化解析页
+│   ├── result_management.py        # 结果管理页
+│   └── system_logs.py              # 系统日志页
 │
 ├── utils/                          # 工具模块
 │   ├── __init__.py
-│   ├── logger.py                   # 日志系统
+│   ├── logger.py                   # 日志系统（改进 cursor 管理）
 │   ├── export.py                   # 导出工具
-│   └── pinyin_utils.py             # 拼音转换
+│   ├── pinyin_utils.py             # 拼音转换
+│   └── progress.py                 # 进度条工具
+│
+├── tests/                          # 测试模块
+│   └── ...
 │
 ├── models/                         # 本地模型目录（可选）
 │   └── iic/

@@ -25,22 +25,23 @@ import threading
 from config import Config
 from database.data_loader import DataLoader
 from database.vector_store import VectorStore
-from model.embedding import AddressEmbedder
 from matching.ranking import RankingEngine, determine_match_status
 from utils.logger import logger
 
 class AddressMatcher:
     """
     地址匹配器
-    
+
     实现两阶段地址匹配流程：粗召回 + MGeo精排
-    
+
+    模型实例（embedder / ranking_engine）采用延迟加载，首次访问时通过
+    app_common 的全局缓存获取，避免每次创建 AddressMatcher 都重新加载
+    模型（每次加载耗时 5-15 秒，占用 400MB-1GB 内存）。
+
     Attributes:
         db: 数据库连接对象
         data_loader: 数据加载器
         vector_store: 向量存储管理器
-        embedder: 地址向量化器
-        ranking_engine: 精排引擎
         threshold: 相似度阈值（用于粗召回阶段过滤候选）
         mode: 匹配模式，默认 'two_stage'（两阶段匹配：粗召回+MGeo精排）
         is_running: 是否正在运行
@@ -55,11 +56,11 @@ class AddressMatcher:
         error_message: 错误信息
         matching_thread: 匹配后台线程
     """
-    
+
     def __init__(self, db_connection, device=None, mode='two_stage'):
         """
         初始化地址匹配器
-        
+
         Args:
             db_connection: DBConnection 对象
             device: 运行设备 ('cuda' 或 'cpu')
@@ -69,10 +70,12 @@ class AddressMatcher:
         self.db = db_connection
         self.data_loader = DataLoader(db_connection)
         self.vector_store = VectorStore(db_connection)
-        self.embedder = AddressEmbedder(device=device)
-        self.ranking_engine = RankingEngine(device=device)
+        self._device = device
+        self._embedder = None
+        self._ranking_engine = None
         self.threshold = Config.SIMILARITY_THRESHOLD
         self.mode = mode
+        self._lock = threading.Lock()  # 线程锁，保护状态字段的读写
         self.is_running = False
         self.is_paused = False
         self.processed_count = 0
@@ -85,36 +88,57 @@ class AddressMatcher:
         self.status_message = ''
         self.error_message = ''
         self.matching_thread = None
+
+    @property
+    def embedder(self):
+        """延迟加载向量化模型（使用全局缓存单例，避免重复加载占内存）"""
+        if self._embedder is None:
+            from app_common import get_cached_embedder
+            self._embedder = get_cached_embedder(self._device)
+        return self._embedder
+
+    @property
+    def ranking_engine(self):
+        """延迟加载精排引擎（使用全局缓存模型单例，避免重复加载占内存）"""
+        if self._ranking_engine is None:
+            from app_common import get_cached_mgeo_model
+            mgeo_model = get_cached_mgeo_model(self._device)
+            self._ranking_engine = RankingEngine(device=self._device, model=mgeo_model)
+            self._ranking_engine.threshold = self.threshold
+        return self._ranking_engine
     
     def set_threshold(self, threshold):
         """
         设置相似度阈值
-        
+
         Args:
-            threshold: 相似度阈值 (0-1)
+            threshold: 新的相似度阈值
         """
         self.threshold = threshold
-        self.ranking_engine.threshold = threshold
+        # 仅在 ranking_engine 已加载时同步阈值，避免触发延迟加载
+        if self._ranking_engine is not None:
+            self._ranking_engine.threshold = threshold
     
     def get_status(self):
         """
-        获取当前匹配状态
-        
+        获取当前匹配状态（线程安全）
+
         Returns:
             dict: 状态信息字典
         """
-        return {
-            'is_running': self.is_running,
-            'is_paused': self.is_paused,
-            'processed_count': self.processed_count,
-            'total_count': self.total_count,
-            'current_stage': self.current_stage,
-            'progress': self.progress,
-            'speed': self.speed,
-            'remaining_time': self.remaining_time,
-            'status_message': self.status_message,
-            'error_message': self.error_message
-        }
+        with self._lock:
+            return {
+                'is_running': self.is_running,
+                'is_paused': self.is_paused,
+                'processed_count': self.processed_count,
+                'total_count': self.total_count,
+                'current_stage': self.current_stage,
+                'progress': self.progress,
+                'speed': self.speed,
+                'remaining_time': self.remaining_time,
+                'status_message': self.status_message,
+                'error_message': self.error_message
+            }
     
     def run_full_pipeline(self, enterprise_table, enterprise_id_col, enterprise_name_col, 
                           enterprise_address_col, standard_table, standard_id_col, 
@@ -304,7 +328,120 @@ class AddressMatcher:
         logger.info(f"Two-stage matching completed. Total time: {total_time:.2f}s")
         
         self.status_message = '匹配完成'
-    
+
+    def run_two_stage_pipeline_streaming(self, enterprise_table, enterprise_id_col, enterprise_name_col,
+                                         enterprise_address_col, standard_table, standard_id_col,
+                                         standard_address_col, result_table=None,
+                                         progress_callback=None, batch_enterprise_size=1000):
+        """
+        流式两阶段匹配管线（支持超大规模数据）
+
+        与 run_two_stage_pipeline 的区别：
+            - 使用服务端游标流式召回，避免全量 fetchall OOM
+            - 召回→精排→写库 以流水线方式执行，每批 batch_enterprise_size 家企业
+            - 全程不累积全量召回结果，内存占用恒定
+            - 召回阈值即精排阈值，避免双重过滤
+
+        适用场景：企业数 ≥ 10 万（小数据量用 run_two_stage_pipeline 更简单）
+
+        Args:
+            enterprise_table: 企业向量表名
+            enterprise_id_col: 企业标识字段名（流式模式未使用，保留兼容）
+            enterprise_name_col: 企业名字段名（流式模式未使用，保留兼容）
+            enterprise_address_col: 企业地址字段名（流式模式未使用，保留兼容）
+            standard_table: 标准地址向量表名
+            standard_id_col: 标准地址编码字段名（流式模式未使用，保留兼容）
+            standard_address_col: 标准地址字段名（流式模式未使用，保留兼容）
+            result_table: 结果表名（可选）
+            progress_callback: 进度回调函数（可选）
+            batch_enterprise_size: 每批处理的企业数量，控制内存占用上限
+        """
+        logger.info("Starting streaming two-stage matching pipeline...")
+        start_time = time.time()
+
+        self.current_stage = '流式匹配（召回+精排）'
+        self.status_message = '正在执行流式匹配...'
+
+        # 获取总企业数
+        total = self.vector_store.get_vector_count(enterprise_table)
+        self.total_count = total
+        processed = 0
+
+        if total == 0:
+            logger.warning("企业向量表为空，跳过流式匹配")
+            return
+
+        # 确保结果表存在并清空
+        self.data_loader.create_result_table(result_table)
+        self.data_loader.truncate_result_table(result_table)
+
+        # 召回阈值即精排阈值，流式管线内不重复过滤
+        threshold = self.threshold
+
+        logger.info(f"流式匹配参数: total={total}, batch_enterprise_size={batch_enterprise_size}, threshold={threshold}")
+
+        # 流式召回 → 精排 → 写库
+        for batch in self.vector_store.batch_recall_streaming(
+            enterprise_table, standard_table,
+            top_n=Config.RECALL_TOP_N,
+            similarity_threshold=threshold,
+            batch_enterprise_size=batch_enterprise_size
+        ):
+            # 召回前检查取消
+            if not self.is_running:
+                logger.info("流式匹配被用户取消（召回阶段）")
+                self.current_stage = '已取消'
+                self.status_message = '流式匹配已取消'
+                return
+
+            # 精排该 batch
+            # similarity_threshold=None 跳过 Python 层重复过滤（召回阶段 SQL 层已过滤）
+            ranked = self.ranking_engine.batch_rank_optimized(
+                batch,
+                similarity_threshold=None,
+                chunk_size=batch_enterprise_size,
+                cancel_check=lambda: not self.is_running
+            )
+
+            # 取消时 ranked 可能包含 None（未处理的占位），过滤掉
+            valid_ranked = [r for r in ranked if r is not None]
+
+            # 立即写库，释放内存
+            if valid_ranked:
+                self.data_loader.insert_match_results(valid_ranked, result_table)
+
+            processed += len(batch)
+            self.processed_count = processed
+            self.progress = processed / total if total > 0 else 1.0
+
+            # 更新速度和剩余时间
+            elapsed = time.time() - start_time
+            self.speed = processed / elapsed if elapsed > 0 else 0
+            self.remaining_time = (total - processed) / self.speed if self.speed > 0 else 0
+
+            if progress_callback:
+                progress_callback({
+                    'stage': '流式匹配（召回+精排）',
+                    'processed': processed,
+                    'total': total,
+                    'progress': self.progress,
+                    'speed': self.speed,
+                    'remaining_time': self.remaining_time
+                })
+
+            # 写库后再次检查取消
+            if not self.is_running:
+                logger.info("流式匹配被用户取消（写库后）")
+                self.current_stage = '已取消'
+                self.status_message = '流式匹配已取消'
+                return
+
+        total_time = time.time() - start_time
+        self.progress = 1.0
+        self.status_message = '流式匹配完成'
+        self.current_stage = '流式匹配完成'
+        logger.info(f"流式匹配完成。共处理 {processed} 企业，耗时 {total_time:.2f}s")
+
     def match_batch(self, df):
         """
         批量匹配（单阶段模式使用）
@@ -461,7 +598,8 @@ class AddressMatcher:
         仅对单阶段匹配模式（mode != 'two_stage'）有效，
         两阶段模式（two_stage）中未实现暂停逻辑。
         """
-        self.is_paused = True
+        with self._lock:
+            self.is_paused = True
         logger.info("Matching paused")
 
     def resume(self):
@@ -471,7 +609,8 @@ class AddressMatcher:
         仅对单阶段匹配模式（mode != 'two_stage'）有效，
         两阶段模式（two_stage）中未实现恢复逻辑。
         """
-        self.is_paused = False
+        with self._lock:
+            self.is_paused = False
         logger.info("Matching resumed")
 
     def stop(self):
@@ -481,8 +620,9 @@ class AddressMatcher:
         设置 is_running=False 终止主循环，同时取消数据库后端正在执行的查询，
         避免后台 SQL 查询继续占用资源。
         """
-        self.is_running = False
-        self.is_paused = False
+        with self._lock:
+            self.is_running = False
+            self.is_paused = False
         try:
             self.db.cancel_current_query()
         except Exception as e:
@@ -522,7 +662,7 @@ class AddressMatcher:
     
     def start_recall_async(self, enterprise_table, standard_table, top_n=50,
                           progress_callback=None, completed_callback=None,
-                          recall_table=None):
+                          recall_table=None, ef_search=None):
         """
         异步启动粗召回任务（分步执行模式）
 
@@ -533,6 +673,7 @@ class AddressMatcher:
             progress_callback: 进度回调函数
             completed_callback: 完成回调函数
             recall_table: 召回结果表名（可选，支持标签特定表）
+            ef_search: HNSW 索引的 ef_search 参数，None 时使用默认计算逻辑
         """
         if self.matching_thread and self.matching_thread.is_alive():
             logger.warning("Matching thread is already running")
@@ -560,7 +701,8 @@ class AddressMatcher:
                     enterprise_table,
                     standard_table,
                     top_n=top_n,
-                    similarity_threshold=self.threshold
+                    similarity_threshold=self.threshold,
+                    ef_search=ef_search
                 )
 
                 # 检查是否在 batch_recall 期间被取消

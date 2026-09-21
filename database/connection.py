@@ -19,6 +19,8 @@
     - 使用 RealDictCursor 返回字典形式的查询结果
 """
 
+import time
+import threading
 import psycopg2
 import psycopg2.extras
 from config import Config
@@ -59,7 +61,7 @@ class DBConnection:
     def __init__(self, host=None, port=None, dbname=None, user=None, password=None, schema=None):
         """
         初始化数据库连接配置
-        
+
         Args:
             host: 数据库主机地址，默认使用 Config.DB_HOST
             port: 数据库端口，默认使用 Config.DB_PORT
@@ -76,6 +78,9 @@ class DBConnection:
         self.schema = schema or Config.DB_SCHEMA
         self.conn = None
         self.cursor = None
+        self._prev_cursor = None  # 上一次 execute() 返回的 cursor，下次执行时自动关闭
+        self._last_check_time = 0  # 上次连接检查时间戳，用于减少 SELECT 1 频率
+        self._check_lock = threading.Lock()  # 保护 _check_connection 的并发访问
     
     def connect(self):
         """
@@ -135,21 +140,28 @@ class DBConnection:
         """
         检查数据库连接是否正常
 
-        通过执行简单的 SELECT 1 查询来验证连接状态。
+        使用 5 秒缓存间隔，避免高频调用时每次都执行 SELECT 1 增加数据库往返开销。
+        线程安全：使用 _check_lock 保护，避免多线程并发检查导致的竞态条件。
 
         Returns:
             bool: 连接正常返回 True，否则返回 False
         """
-        try:
-            if self.conn:
-                cur = self.conn.cursor()
-                cur.execute("SELECT 1")
-                cur.fetchone()
-                cur.close()
+        with self._check_lock:
+            # 5秒内不重复检查，减少 DB 往返
+            now = time.time()
+            if self.conn and (now - self._last_check_time) < 5:
                 return True
-        except Exception:
-            pass
-        return False
+            try:
+                if self.conn:
+                    cur = self.conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    cur.close()
+                    self._last_check_time = now
+                    return True
+            except Exception:
+                pass
+            return False
     
     def execute(self, sql, params=None):
         """
@@ -157,6 +169,7 @@ class DBConnection:
 
         支持自动重连机制，如果连接断开会尝试重新连接。
         每次执行查询时创建新的 cursor，避免 cursor 状态污染导致的 'no results to fetch' 错误。
+        自动关闭上一次 execute() 返回的 cursor，防止资源泄漏。
 
         Args:
             sql: SQL 语句
@@ -165,6 +178,14 @@ class DBConnection:
         Returns:
             cursor: 执行成功返回游标对象，失败返回 None
         """
+        # 自动关闭上一次返回的 cursor，防止资源泄漏
+        if self._prev_cursor:
+            try:
+                self._prev_cursor.close()
+            except Exception:
+                pass
+            self._prev_cursor = None
+
         try:
             # 检查连接状态，必要时重新连接
             need_reconnect = not self.conn or not self._check_connection()
@@ -175,6 +196,7 @@ class DBConnection:
             # 特别是避免之前执行过 CREATE TABLE 等 DDL 语句的 cursor 被复用
             cursor = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cursor.execute(sql, params)
+            self._prev_cursor = cursor  # 记录以便下次自动关闭
             return cursor
         except Exception as e:
             logger.error(f"SQL execution error: {str(e)}")
@@ -230,6 +252,25 @@ class DBConnection:
         if self.conn:
             self.conn.commit()
             logger.info("Transaction committed")
+
+    def get_cursor(self):
+        """
+        获取独立的数据库游标，用于 execute_values 等需要直接操作 cursor 的场景
+
+        每次调用都创建新的 cursor，避免多线程共享 cursor 导致的数据错乱。
+        调用方使用完毕后应调用 cursor.close() 关闭。
+
+        Returns:
+            cursor: 新创建的 RealDictCursor，连接异常时返回 None
+        """
+        try:
+            if not self.conn or not self._check_connection():
+                if not self.connect():
+                    return None
+            return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        except Exception as e:
+            logger.error(f"获取 cursor 失败: {str(e)}")
+            return None
     
     def rollback(self):
         """回滚事务"""

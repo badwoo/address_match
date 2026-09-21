@@ -50,6 +50,7 @@ class AddressTaggingParser:
         self.device = device or Config.DEVICE
         self.mode = mode
         self.model = None
+        self.rule_engine = None
         self.is_running = False
         self.progress = 0.0
         self.processed_count = 0
@@ -66,6 +67,7 @@ class AddressTaggingParser:
         self.completion_end_time = None
         self.completion_copy_table = ''
         self.completion_source_table = ''
+        self.completion_result_table = ''  # 结果表名（数据库模式或文件模式+db_conn时存在）
 
     @property
     def output_fields(self):
@@ -95,9 +97,20 @@ class AddressTaggingParser:
         return '12级'
 
     def _load_model(self):
+        if self.mode == '12':
+            # 12级使用纯规则引擎，无需加载MGeo/PyTorch模型
+            if self.rule_engine is None:
+                logger.info("[地址结构化解析] 加载12级规则引擎...")
+                from matching.address_tagging_rules import RuleBasedAddressTaggingEngine
+                self.rule_engine = RuleBasedAddressTaggingEngine()
+                logger.info("[地址结构化解析] 12级规则引擎加载完成")
+            return True
+
         if self.model is None:
             logger.info("[地址结构化解析] 加载地址要素解析模型...")
-            self.model = AddressTaggingModel(device=self.device)
+            # 使用全局缓存的模型实例，避免每次解析都重新加载（5-15秒/次）
+            from app_common import get_cached_tagging_model
+            self.model = get_cached_tagging_model(self.device)
             logger.info("[地址结构化解析] 地址要素解析模型加载完成")
         return True
 
@@ -132,7 +145,8 @@ class AddressTaggingParser:
                 'completion_results': self.completion_results,
                 'completion_end_time': self.completion_end_time,
                 'completion_copy_table': self.completion_copy_table,
-                'completion_source_table': self.completion_source_table
+                'completion_source_table': self.completion_source_table,
+                'completion_result_table': self.completion_result_table
             }
 
     def _update_status(self, **kwargs):
@@ -187,16 +201,17 @@ class AddressTaggingParser:
                 results = self.model.predict_17_2(addresses, batch_size=batch_size)
             elif self.mode == '17':
                 results = self.model.predict_17(addresses, batch_size=batch_size)
+            elif self.mode == '12':
+                # 12级使用纯规则引擎，无需GPU批量推理
+                results = self.rule_engine.parse(addresses)
             else:
                 results = self.model.predict(addresses, batch_size=batch_size)
         except Exception as e:
             logger.error(f"[地址结构化解析] 批量预测失败: {str(e)}")
-            self._update_status(
-                is_running=False, progress=1.0, processed_count=total,
-                status_message=f'地址{self.level_name}结构化解析失败'
-            )
-            empty = {field: '' for field in fields}
-            return [{'original_address': a, **empty} for a in addresses]
+            # 不再吞掉异常返回空结果列表，否则 task_func 会误认为成功（results 非空）
+            # 进而设置 completion_success=True，UI 显示"解析完成"而非"解析失败"。
+            # 直接抛出异常让 task_func 进入失败分支设置 completion_success=False。
+            raise
 
         # 17/17_2模式：将 id_field 插入到结果最前面
         if need_id_field and id_values:
@@ -206,8 +221,11 @@ class AddressTaggingParser:
         elapsed = time.time() - start_time
         speed = total / elapsed if elapsed > 0 else 0
 
+        # 注意：此处不设置 is_running=False，由调用方（task_func）统一设置完成状态
+        # （is_running=False + completed=True），避免 fragment 在两个状态设置之间
+        # 读到 is_running=False, completed=False 的中间状态导致完成页面不跳转。
         self._update_status(
-            is_running=False, progress=1.0, processed_count=total,
+            progress=1.0, processed_count=total,
             speed=speed, remaining_time=0,
             status_message=f'地址{self.level_name}结构化解析完成'
         )
@@ -289,25 +307,47 @@ class AddressTaggingParser:
 
         start_time = time.time()
         processed = 0
-        offset = 0
+        last_ctid = None  # ctid游标，用于keyset pagination替代OFFSET深分页
+        batch_idx = 0
 
-        while offset < total:
+        while processed < total:
             if not self.is_running:
                 logger.info(f"[地址{self.level_name}结构化解析] 用户停止，已处理 {processed:,} 行")
                 break
 
-            # 分批读取源表数据
-            sql = f"SELECT * FROM {quote_identifier(table_name)} ORDER BY ctid LIMIT {db_batch_size} OFFSET {offset}"
-            cursor = db_conn.execute(sql)
+            # 使用ctid keyset pagination替代OFFSET深分页
+            # 原因：OFFSET深分页在百万级数据时性能急剧下降（需扫描并丢弃N行），
+            #   在 offset=48万 附近可能导致SQL超时，db_conn.execute返回None，
+            #   进而触发静默break导致"假完成"。keyset pagination通过 WHERE ctid > last_ctid
+            #   直接定位游标位置，性能稳定不随offset增长而退化。
+            # ctid是PostgreSQL系统列，表示行的物理位置，天然有序且唯一，
+            #   在源表不被UPDATE/DELETE的场景下（如分词只读源表）可安全使用。
+            if last_ctid is None:
+                sql = f"SELECT ctid, * FROM {quote_identifier(table_name)} ORDER BY ctid LIMIT %s"
+                cursor = db_conn.execute(sql, (db_batch_size,))
+            else:
+                sql = f"SELECT ctid, * FROM {quote_identifier(table_name)} WHERE ctid > %s::tid ORDER BY ctid LIMIT %s"
+                cursor = db_conn.execute(sql, (str(last_ctid), db_batch_size))
+
             if not cursor:
-                break
+                # 数据库执行失败时必须抛异常，避免静默退出导致假完成
+                # （原实现此处为 break，导致循环外设置 progress=1.0 假完成状态）
+                raise RuntimeError(
+                    f"数据库查询失败（batch_idx={batch_idx}, processed={processed:,}, "
+                    f"last_ctid={last_ctid}），表: {table_name}"
+                )
+
             rows = cursor.fetchall()
             if not rows:
                 break
 
-            df = pd.DataFrame(rows)
+            # 记录本批最后一条的ctid，供下一批查询使用
+            last_ctid = rows[-1]['ctid']
+            batch_count = len(rows)
+
+            # 构建DataFrame时排除ctid列（ctid是系统列，不应出现在业务数据中）
+            df = pd.DataFrame([{k: v for k, v in row.items() if k != 'ctid'} for row in rows])
             addresses = df[address_col].fillna('').astype(str).tolist()
-            batch_count = len(addresses)
 
             # 提取标识字段值（17/17_2模式）
             id_values = None
@@ -320,10 +360,13 @@ class AddressTaggingParser:
                     batch_results = self.model.predict_17_2(addresses)
                 elif self.mode == '17':
                     batch_results = self.model.predict_17(addresses)
+                elif self.mode == '12':
+                    # 12级使用纯规则引擎，无需GPU批量推理
+                    batch_results = self.rule_engine.parse(addresses)
                 else:
                     batch_results = self.model.predict(addresses)
             except Exception as e:
-                logger.error(f"[地址{self.level_name}结构化解析] 批次预测失败 offset={offset}: {e}")
+                logger.error(f"[地址{self.level_name}结构化解析] 批次预测失败 batch_idx={batch_idx}: {e}")
                 batch_results = [{'original_address': a, **{f: '' for f in fields}} for a in addresses]
 
             # 17/17_2模式：将 id_field 插入到结果最前面
@@ -340,11 +383,14 @@ class AddressTaggingParser:
                 inserted = data_loader.insert_address_tagging_results(batch_results, result_table_name)
 
             if inserted == 0 and batch_results:
-                logger.error(f"[地址{self.level_name}结构化解析] 批次写入失败 offset={offset}, 行数={batch_count}")
-                break
+                # 写入失败时必须抛异常，避免静默退出导致假完成
+                raise RuntimeError(
+                    f"结果写入失败（batch_idx={batch_idx}, processed={processed:,}, "
+                    f"行数={batch_count}），结果表: {result_table_name}"
+                )
 
             processed += batch_count
-            offset += db_batch_size
+            batch_idx += 1
 
             # 更新进度
             elapsed = time.time() - start_time
@@ -360,15 +406,37 @@ class AddressTaggingParser:
             )
 
             # 显式释放内存
-            del df, addresses, batch_results
+            del df, addresses, batch_results, rows
 
         elapsed = time.time() - start_time
         speed = processed / elapsed if elapsed > 0 else 0
+
+        # 用户主动停止时，processed可能小于total，这是正常的中断，不算失败
+        if not self.is_running:
+            logger.info(f"[地址{self.level_name}结构化解析] 用户停止，已处理 {processed:,}/{total:,} 行")
+            self._update_status(
+                is_running=False,
+                progress=processed / total if total > 0 else 0,
+                processed_count=processed, speed=speed,
+                status_message=f'地址{self.level_name}结构化解析已停止（已处理 {processed:,}/{total:,}）'
+            )
+            return processed
+
+        # 正常结束循环但处理数不足总数，说明中途有未预期的数据丢失，抛异常暴露问题
+        if processed < total:
+            raise RuntimeError(
+                f"流式处理异常终止：已处理 {processed:,} 条，但总行数为 {total:,}，"
+                f"差额 {total - processed:,} 条未处理（表: {table_name}）"
+            )
+
         logger.info(f"[地址{self.level_name}结构化解析] 流式处理完成，共 {processed:,} 条，"
                    f"耗时 {elapsed:.2f}s，速度 {speed:.1f}条/秒")
 
+        # 注意：此处不设置 is_running=False，由调用方（task_func）统一设置完成状态
+        # （is_running=False + completed=True），避免 fragment 在两个状态设置之间
+        # 读到 is_running=False, completed=False 的中间状态导致完成页面不跳转。
         self._update_status(
-            is_running=False, progress=1.0, processed_count=processed,
+            progress=1.0, processed_count=processed,
             speed=speed, remaining_time=0,
             status_message=f'地址{self.level_name}结构化解析完成'
         )
@@ -410,6 +478,8 @@ def run_address_tagging_async(parser, data_source, address_col,
         source_table = table_name or ''
         end_time = None
         result_count = 0
+        results = None  # 文件模式下保存解析结果列表供 UI 显示；数据库模式保持 None
+        target_table = ''  # 结果表名（数据库模式或文件模式+db_conn时存在）
 
         try:
             parser._update_status(is_running=True, status_message='正在加载数据...')
@@ -466,14 +536,18 @@ def run_address_tagging_async(parser, data_source, address_col,
                     raise ValueError("不支持的数据源类型")
 
                 if not results:
-                    parser._update_status(
-                        is_running=False, status_message='无解析结果',
-                        error_message='没有可解析的数据'
-                    )
+                    # 所有状态放在同一个锁块内设置，避免 fragment 在两个锁块之间
+                    # 读取到 is_running=False, completed=False 的中间状态，
+                    # 导致完成页面不跳转（误判为未开始或回退到输入选择分支）
+                    end_time = time.time()
                     with parser._lock:
+                        parser.is_running = False
+                        parser.status_message = '无解析结果'
+                        parser.error_message = '没有可解析的数据'
                         parser.completed = True
                         parser.completion_success = False
                         parser.completion_message = '没有可解析的数据'
+                        parser.completion_end_time = end_time
                     if completed_callback:
                         completed_callback(False, '没有可解析的数据', None)
                     return
@@ -525,18 +599,21 @@ def run_address_tagging_async(parser, data_source, address_col,
                             )
 
             end_time = time.time()
-            parser._update_status(
-                is_running=False, progress=1.0,
-                status_message='地址结构化解析完成'
-            )
+            # 所有完成状态放在同一个锁块内设置，避免 fragment 在两个锁块之间
+            # 读取到 is_running=False, completed=False 的中间状态，导致完成页面不跳转。
+            # 文件模式保存结果列表供 UI 显示下载；数据库模式结果已写入结果表，results 保持 None。
             with parser._lock:
+                parser.is_running = False
+                parser.progress = 1.0
+                parser.status_message = '地址结构化解析完成'
                 parser.completed = True
                 parser.completion_success = True
                 parser.completion_message = '解析完成'
-                parser.completion_results = None
+                parser.completion_results = results
                 parser.completion_end_time = end_time
                 parser.completion_copy_table = copy_table
                 parser.completion_source_table = source_table
+                parser.completion_result_table = target_table
 
             if completed_callback:
                 completed_callback(True, '解析完成', None)
@@ -546,12 +623,11 @@ def run_address_tagging_async(parser, data_source, address_col,
             import traceback
             logger.error(f"[地址结构化解析] 详细堆栈: {traceback.format_exc()}")
             end_time = time.time()
-            parser._update_status(
-                is_running=False,
-                error_message=str(e),
-                status_message='地址结构化解析失败'
-            )
+            # 所有失败状态放在同一个锁块内设置，避免 fragment 读取到中间状态
             with parser._lock:
+                parser.is_running = False
+                parser.error_message = str(e)
+                parser.status_message = '地址结构化解析失败'
                 parser.completed = True
                 parser.completion_success = False
                 parser.completion_message = str(e)

@@ -211,7 +211,12 @@ def inject_global_styles():
         letter-spacing: -0.3px;
     }}
 
-    /* 侧边栏导航按钮 */
+    /* ===== 隐藏 Streamlit 自动生成的页面导航（使用自定义导航） ===== */
+    [data-testid="stSidebarNav"] {{
+        display: none !important;
+    }}
+
+    /* ===== 侧边栏导航按钮 ===== */
     [data-testid="stSidebar"] button {{
         border-radius: {Radius.SM} !important;
         font-weight: {Typography.WEIGHT_MEDIUM} !important;
