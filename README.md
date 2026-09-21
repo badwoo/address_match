@@ -7,7 +7,6 @@
 ---
 
 ## 核心能力
-
 | 功能模块 | 说明 |
 | --- | --- |
 | 数据库配置 | 连接 PostgreSQL，配置主机/库名/Schema，测试连通性 |
@@ -25,24 +24,25 @@
 
 ### 两阶段流程
 
-```
-企业地址 ──┐
-           ├─→ AddressEmbedder ──→ 768 维向量 ──→ enterprise_vectors
-标准地址 ──┘                                    standard_address_vectors
-                                                         │
-        ┌────────── 阶段 1：粗召回 ──────────┐            │
-        │ VectorStore.batch_recall()        │◀───────────┘
-        │ pgvector 余弦相似度 + JOIN LATERAL │
-        │ 每个企业地址召回 Top-K 候选        │
-        └───────────────┬───────────────────┘
-                        ▼
-        ┌────────── 阶段 2：精排 ────────────┐
-        │ RankingEngine.batch_rank_optimized │
-        │ MGeo 精排模型 → exact / partial /   │
-        │ not_match 三分类概率                │
-        └───────────────┬───────────────────┘
-                        ▼
-              匹配结果（含房号）+ 人工纠正
+```mermaid
+flowchart TD
+    ENT["企业地址表"] --> EMB1["AddressEmbedder<br/>MGeo Backbone 编码"]
+    STD["标准地址表"] --> EMB2["AddressEmbedder<br/>MGeo Backbone 编码"]
+    EMB1 --> EV[("enterprise_vectors<br/>768 维向量")]
+    EMB2 --> SV[("standard_address_vectors<br/>768 维向量")]
+
+    subgraph STAGE1["阶段 1：向量粗召回"]
+        RECALL["VectorStore.batch_recall()<br/>pgvector 余弦相似度 + JOIN LATERAL<br/>SQL 层相似度阈值过滤<br/>每个企业地址召回 Top-K 候选"]
+    end
+
+    subgraph STAGE2["阶段 2：MGeo 精排"]
+        RANK["RankingEngine.batch_rank_optimized()<br/>输出三分类概率<br/>exact_match / partial_match / not_match"]
+    end
+
+    EV --> RECALL
+    SV --> RECALL
+    RECALL -->|"recall_results"| RANK
+    RANK -->|"match_results"| RESULT["匹配结果（含房号）<br/>人工纠正 / 导出"]
 ```
 
 **精排排序规则**：`exact_match` 降序 → `partial_match` 降序 → `not_match` 升序；匹配状态取三者概率最大值对应的类别。
@@ -58,9 +58,9 @@
 - **界面**：Streamlit 1.38
 - **数据库**：PostgreSQL 14+ / pgvector 0.4
 - **模型**：阿里 MGeo（ModelScope）
-  - 粗召回：`iic/mgeo_backbone_chinese_base`（768 维向量）
-  - 精排：`iic/mgeo_geographic_entity_alignment_chinese_base`（三分类）
-  - 地址解析：`iic/mgeo_geographic_ner_chinese_base`
+    - 粗召回：`iic/mgeo_backbone_chinese_base`（768 维向量）
+    - 精排：`iic/mgeo_geographic_entity_alignment_chinese_base`（三分类）
+    - 地址解析：`iic/mgeo_geographic_ner_chinese_base`
 - **推理框架**：PyTorch（支持 CUDA，自动检测 GPU 并回退 CPU）
 - **其他**：pandas、psycopg2、openpyxl、pypinyin
 
@@ -125,7 +125,7 @@ venv\Scripts\activate          # Windows
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-> `requirements.txt` 中 `torch` 指向本地 wheel 文件（`torch-2.11.0+cu130-cp312-cp312-win_amd64.whl`）。
+> `requirements.txt` 中 `torch` 指向本地 wheel 文件（`torch-2.11.0+cu130-cp312-cp312-win_amd64.whl`）。  
 > 该文件缺失或环境不匹配时，请自行安装对应版本的 PyTorch：
 > ```bash
 > pip install torch --index-url https://download.pytorch.org/whl/cu130
@@ -145,7 +145,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ```sql
 CREATE DATABASE your_db;
-\c prj_sj_db
+\c your_db
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE SCHEMA IF NOT EXISTS ai;
 ```
@@ -155,11 +155,11 @@ CREATE SCHEMA IF NOT EXISTS ai;
 复制 `.env.example` 为 `.env` 并按实际环境填写：
 
 ```env
-DB_HOST=localhost
-DB_PORT=5432
+DB_HOST=
+DB_PORT=
 DB_NAME=
 DB_USER=
-DB_PASSWORD=your_password_here
+DB_PASSWORD=
 DB_SCHEMA=
 ```
 
@@ -181,8 +181,12 @@ python launcher.py
 
 ## 使用流程
 
-```
-数据库配置 → 向量预处理 → 地址匹配 → 结果管理 → 人工纠正
+```mermaid
+flowchart LR
+    S1["① 数据库配置<br/>连接并测试连通性"] --> S2["② 向量预处理<br/>向量化 + 建立索引"]
+    S2 --> S3["③ 地址匹配<br/>粗召回 + MGeo 精排"]
+    S3 --> S4["④ 结果管理<br/>浏览 / 筛选 / 导出"]
+    S4 --> S5["⑤ 人工纠正<br/>修正偏差结果"]
 ```
 
 1. **数据库配置**：填写连接参数并测试连接，确认数据表可见
@@ -204,7 +208,6 @@ python launcher.py
 ---
 
 ## 主要数据表
-
 | 表名 | 用途 |
 | --- | --- |
 | `enterprise_vectors` | 企业地址向量（768 维） |
@@ -226,7 +229,7 @@ pytest tests/test_vector_store_rename.py           # 单个文件
 pytest tests/test_vector_store_rename.py::TestVectorStoreRename::test_rename   # 单个用例
 ```
 
-测试主要覆盖数据库 Schema/表名映射、向量表切换、房号提取、流式管线等回归场景。
+测试主要覆盖数据库 Schema/表名映射、向量表切换、房号提取、流式管线等回归场景。  
 修改 `database/`、`matching/`、`model/` 后建议运行相关测试验证。
 
 ---
@@ -238,26 +241,24 @@ pytest tests/test_vector_store_rename.py::TestVectorStoreRename::test_rename   #
 - `extract_house_number(text)`：房号提取核心函数
 - `batch_update_house_number(...)`：批量更新存储过程，支持传入表名、地址字段、房号字段与额外过滤条件
 
-采用 `ctid` keyset pagination 分批处理，避免大表更新时越跑越慢。
-详细说明与规则分析见 [sql/提取房号解析存储过程.md](sql/提取房号解析存储过程.md)。
+采用 `ctid` keyset pagination 分批处理，避免大表更新时越跑越慢。  
+详细说明与规则分析见 [sql/提取房号解析存储过程.md](sql/%E6%8F%90%E5%8F%96%E6%88%BF%E5%8F%B7%E8%A7%A3%E6%9E%90%E5%AD%98%E5%82%A8%E8%BF%87%E7%A8%8B.md)。
 
 ---
 
 ## 文档索引
-
 | 文档 | 内容 |
 | --- | --- |
 | [CODE_WIKI.md](CODE_WIKI.md) | 模块级代码详解与依赖关系 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 架构设计、数据流、表结构 |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | 部署说明 |
 | [OPERATION_MANUAL.md](OPERATION_MANUAL.md) | 操作手册 |
-| [CLAUDE.md](CLAUDE.md) | 面向 AI 辅助开发的工程约定 |
 
 ---
 
 ## 注意事项
 
-- 数据库连接参数可通过 `.env` 管理
+- 数据库连接参数可通过 `.env` 管理，**请勿将 **`**.env**`** 提交至仓库**
 - 模型权重（`models/`）、虚拟环境（`venv/`）已在 `.gitignore` 中排除，需各自本地准备
 - 默认相似度阈值 `0.8`、召回数量 `50`，可在 `config.py` 或界面中调整
 - 无 GPU 时自动以 CPU 模式运行，界面上方会显示当前运行设备
